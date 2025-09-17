@@ -174,18 +174,27 @@ with tab2:
             st.subheader("📋 Selecciona qué columnas quieres actualizar")
             columnas_comunes = list(set(df_base_preview.columns) & set(df_nuevo_preview.columns))
             
+            # Excluir columnas importantes que NO deben actualizarse
+            columnas_protegidas = ['Técnico', 'Motivo', 'Visto']
+            columnas_disponibles = [col for col in columnas_comunes if col not in columnas_protegidas]
+            
             # Preseleccionar columnas típicas
             columnas_por_defecto = []
             for col in ['Fecha', 'Hora', 'Campo', 'Dirección Campo']:
-                if col in columnas_comunes:
+                if col in columnas_disponibles:
                     columnas_por_defecto.append(col)
             
             columnas_seleccionadas = st.multiselect(
                 "Columnas a actualizar:",
-                columnas_comunes,
+                columnas_disponibles,
                 default=columnas_por_defecto,
-                help="Solo se actualizarán estas columnas. Tu trabajo en otras columnas se preservará."
+                help="Solo se actualizarán estas columnas. Tu trabajo (Técnico, Motivo, Visto) se preservará automáticamente."
             )
+            
+            # Mostrar advertencia sobre columnas protegidas
+            if columnas_protegidas:
+                st.info(f"🛡️ **Columnas protegidas** (NO se actualizarán): {', '.join(columnas_protegidas)}")
+            
             
             # Selección de columna ID
             st.subheader("🆔 Columna para identificar partidos")
@@ -254,6 +263,21 @@ with tab2:
                                         if partido_actualizado:
                                             partidos_actualizados += 1
                                             df_resultado.loc[idx_martes, 'Ultima_Actualizacion'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                                            
+                                            # Recalcular el campo "Visto" usando la fórmula de Excel exacta
+                                            if 'Visto' in df_resultado.columns:
+                                                vis_c = df_resultado.loc[idx_martes, 'Visualización C'] if 'Visualización C' in df_resultado.columns else ''
+                                                vis_v = df_resultado.loc[idx_martes, 'Visualización V'] if 'Visualización V' in df_resultado.columns else ''
+                                                
+                                                # Convertir a string para manejar NaN
+                                                vis_c_str = str(vis_c) if pd.notna(vis_c) else ''
+                                                vis_v_str = str(vis_v) if pd.notna(vis_v) else ''
+                                                
+                                                # Aplicar fórmula Excel: =SI(Y(J2<>""; M2<>""); "Rellenas"; "Incompletas")
+                                                if vis_c_str != '' and vis_v_str != '':
+                                                    df_resultado.loc[idx_martes, 'Visto'] = 'Rellenas'
+                                                else:
+                                                    df_resultado.loc[idx_martes, 'Visto'] = 'Incompletas'
                                     else:
                                         partidos_sin_match += 1
                                 
@@ -326,7 +350,13 @@ with st.sidebar:
     st.subheader("📋 Procesar Partidos Nuevos")
     st.markdown("""
     - Sube tu CSV de partidos
-    - Sube tu Excel de seguimiento
+    - Sube tu Excel de seguimiento  
+    - Se crean automáticamente las columnas:
+      - **Técnico** (vacía para que asignes)
+      - **Motivo** (vacía para comentarios)
+      - **Visto** (calculada según Visualización C y V):
+        - 🟢 "Rellenas" si ambas visualizaciones tienen datos
+        - 🔴 "Incompletas" si falta alguna visualización
     - Descarga la agenda completa
     """)
     
@@ -335,10 +365,16 @@ with st.sidebar:
     - Sube tu agenda actual (con trabajo hecho)
     - Sube la agenda nueva (datos actualizados)
     - Selecciona qué columnas actualizar
-    - Tu trabajo se preserva
+    - **Técnico, Motivo y Visto se preservan**
     """)
     
-    st.subheader("🛡️ Seguridad")
-    st.success("✅ Tu trabajo nunca se pierde")
-    st.success("✅ Solo se actualizan las columnas que elijas")
-    st.success("✅ Se marca cuando se actualizó cada registro")
+    st.subheader("🛡️ Campo Calculado")
+    st.success("✅ Técnico: Tu trabajo nunca se pierde")
+    st.success("✅ Motivo: Tus comentarios se mantienen")  
+    st.info("🧮 Visto: Replica fórmula Excel exacta:")
+    st.code("=SI(Y(J2<>\"\"; M2<>\"\"); \"Rellenas\"; \"Incompletas\")")
+    st.markdown("""
+    - 🟢 **"Rellenas"** = Visualización C **Y** Visualización V no están vacías
+    - 🔴 **"Incompletas"** = Cualquiera de las dos está vacía
+    """)
+    st.success("✅ Solo se actualizan fechas, horarios, campos, etc.")
