@@ -82,8 +82,32 @@ with tab1:
                 # Realizar la segunda unión
                 resultado = pd.merge(resultado_casa, df_visitante, on=['Competicion', 'Nombre Club Visitante'], how='left')
                 
-                # Establecer orden en las columnas del dataframe
-                nuevo_orden = ['Fecha', 'Hora', 'Jornada', 'Competicion', 'Provincia', 'Nombre Club Casa',
+                # ¡AQUÍ ES DONDE SE CREAN LAS NUEVAS COLUMNAS!
+                # Agregar las columnas de técnico y motivo al inicio (vacías)
+                resultado['Técnico'] = ''  # Columna A - vacía para que puedas llenarla
+                resultado['Motivo'] = ''   # Columna B - vacía para que puedas llenarla
+                
+                # Agregar la columna "Visto" calculada (Columna C)
+                # Replica la fórmula de Excel: =SI(Y(J2<>""; M2<>""); "Rellenas"; "Incompletas")
+                # Donde J = "Visualización C" y M = "Visualización V"
+                def calcular_visto(row):
+                    vis_c = row.get('Visualización C', '')
+                    vis_v = row.get('Visualización V', '')
+                    
+                    # Convertir a string para manejar NaN y otros tipos
+                    vis_c_str = str(vis_c) if pd.notna(vis_c) else ''
+                    vis_v_str = str(vis_v) if pd.notna(vis_v) else ''
+                    
+                    # Aplicar la lógica exacta de Excel: Y(J2<>""; M2<>"")
+                    if vis_c_str != '' and vis_v_str != '':
+                        return 'Rellenas'
+                    else:
+                        return 'Incompletas'
+                
+                resultado['Visto'] = resultado.apply(calcular_visto, axis=1)
+                
+                # Establecer orden en las columnas del dataframe (AHORA con las nuevas columnas primero)
+                nuevo_orden = ['Técnico', 'Motivo', 'Visto', 'Fecha', 'Hora', 'Jornada', 'Competicion', 'Provincia', 'Nombre Club Casa',
                               'Visualización C', 'Detalles Equipo Casa', 'Nombre Club Visitante',
                               'Visualización V', 'Detalles Equipo Visitante', 'Campo', 'Dirección Campo']
                 
