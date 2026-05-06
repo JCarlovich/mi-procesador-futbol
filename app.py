@@ -52,7 +52,14 @@ with tab1:
                 df_partidos['Provincia'] = df_partidos['Competición'].str.extract(r'\((.*?)\)')
                 
                 # Concatenar 'Competición' y 'Grupo' en una nueva columna
-                df_partidos['Competicion'] = df_partidos['Competición'].fillna('').astype(str) + ", " + df_partidos['Grupo'].fillna('').astype(str)
+                # Formateo conservador: enteros como enteros (sin ".0"), NaN como vacío
+                def _fmt(v):
+                    if pd.isna(v):
+                        return ''
+                    if isinstance(v, float) and v.is_integer():
+                        return str(int(v))
+                    return str(v)
+                df_partidos['Competicion'] = df_partidos['Competición'].map(_fmt) + ", " + df_partidos['Grupo'].map(_fmt)
                 
                 # Eliminar las columnas originales 'Competición' y 'Grupo'
                 df_partidos = df_partidos.drop(columns=['Competición', 'Grupo'], errors='ignore')
