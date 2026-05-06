@@ -42,12 +42,18 @@ with tab1:
             with st.spinner('Procesando archivos...'):
                 
                 # Leer el archivo CSV
-                # dtype=str en Competición/Grupo evita que pandas 2.x los infiera como int/float
-                # y rompa la concatenación de más abajo (y evita el sufijo ".0" en enteros).
+                # - dtype=str en Competición/Grupo: evita que pandas los infiera como int/float
+                #   y rompa la concatenación de más abajo.
+                # - index_col=False: el CSV trae un ';' de más al final de cada fila (18 campos
+                #   contra 17 cabeceras). Sin esto, pandas usa la 1ª columna como índice y
+                #   desplaza todos los datos una columna a la izquierda.
                 lect_partidos = pd.read_csv(
                     uploaded_csv, encoding="latin1", on_bad_lines='skip', sep=';',
                     dtype={'Competición': str, 'Grupo': str},
+                    index_col=False,
                 )
+                # Si el separador de más generó una columna sin nombre al final, descártala.
+                lect_partidos = lect_partidos.loc[:, ~lect_partidos.columns.astype(str).str.startswith('Unnamed')]
                 
                 # Crear DataFrame de partidos
                 df_partidos = lect_partidos.drop(columns=['Club Casa', 'Club Visitante', 'Equipo Casa', 'Equipo Visitante',
