@@ -42,7 +42,12 @@ with tab1:
             with st.spinner('Procesando archivos...'):
                 
                 # Leer el archivo CSV
-                lect_partidos = pd.read_csv(uploaded_csv, encoding="latin1", on_bad_lines='skip', sep=';')
+                # dtype=str en Competición/Grupo evita que pandas 2.x los infiera como int/float
+                # y rompa la concatenación de más abajo (y evita el sufijo ".0" en enteros).
+                lect_partidos = pd.read_csv(
+                    uploaded_csv, encoding="latin1", on_bad_lines='skip', sep=';',
+                    dtype={'Competición': str, 'Grupo': str},
+                )
                 
                 # Crear DataFrame de partidos
                 df_partidos = lect_partidos.drop(columns=['Club Casa', 'Club Visitante', 'Equipo Casa', 'Equipo Visitante',
@@ -52,14 +57,7 @@ with tab1:
                 df_partidos['Provincia'] = df_partidos['Competición'].str.extract(r'\((.*?)\)')
                 
                 # Concatenar 'Competición' y 'Grupo' en una nueva columna
-                # Formateo conservador: enteros como enteros (sin ".0"), NaN como vacío
-                def _fmt(v):
-                    if pd.isna(v):
-                        return ''
-                    if isinstance(v, float) and v.is_integer():
-                        return str(int(v))
-                    return str(v)
-                df_partidos['Competicion'] = df_partidos['Competición'].map(_fmt) + ", " + df_partidos['Grupo'].map(_fmt)
+                df_partidos['Competicion'] = df_partidos['Competición'] + ", " + df_partidos['Grupo']
                 
                 # Eliminar las columnas originales 'Competición' y 'Grupo'
                 df_partidos = df_partidos.drop(columns=['Competición', 'Grupo'], errors='ignore')
