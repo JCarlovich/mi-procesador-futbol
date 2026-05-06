@@ -52,7 +52,7 @@ with tab1:
                 df_partidos['Provincia'] = df_partidos['Competición'].str.extract(r'\((.*?)\)')
                 
                 # Concatenar 'Competición' y 'Grupo' en una nueva columna
-                df_partidos['Competicion'] = df_partidos['Competición'] + ", " + df_partidos['Grupo']
+                df_partidos['Competicion'] = df_partidos['Competición'].fillna('').astype(str) + ", " + df_partidos['Grupo'].fillna('').astype(str)
                 
                 # Eliminar las columnas originales 'Competición' y 'Grupo'
                 df_partidos = df_partidos.drop(columns=['Competición', 'Grupo'], errors='ignore')
@@ -63,11 +63,18 @@ with tab1:
                 # Eliminar las primeras 5 filas
                 df_seguimiento = lect_seguimiento.drop(index=lect_seguimiento.index[:5])
                 
-                # Renombrar columnas relevantes
-                df_seguimiento.columns.values[0] = 'Competicion'
-                df_seguimiento.columns.values[2] = 'Nombre Club Casa'
-                df_seguimiento.columns.values[36] = 'Visualización C'
-                df_seguimiento.columns.values[35] = 'Detalles Equipo Casa'
+                # Renombrar columnas relevantes (por posición; reasignar la lista entera para compatibilidad con pandas 2.x)
+                new_cols = df_seguimiento.columns.tolist()
+                if len(new_cols) <= 36:
+                    raise ValueError(
+                        f"El Excel de seguimiento tiene {len(new_cols)} columnas tras quitar las 5 primeras filas; "
+                        "se esperaban al menos 37 (Visualización C en col 37, Detalles Equipo Casa en col 36)."
+                    )
+                new_cols[0] = 'Competicion'
+                new_cols[2] = 'Nombre Club Casa'
+                new_cols[35] = 'Detalles Equipo Casa'
+                new_cols[36] = 'Visualización C'
+                df_seguimiento.columns = new_cols
                 
                 # Seleccionar columnas necesarias
                 df_seguimiento = df_seguimiento[['Competicion', 'Nombre Club Casa', 'Visualización C', 'Detalles Equipo Casa']]
