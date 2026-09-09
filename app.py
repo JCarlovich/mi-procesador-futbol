@@ -218,6 +218,101 @@ def guardar_maestro(df_maestro):
         return False
 
 # =============================================================================
+# ACTUALIZAR EQUIPOS DEL SEGUIMIENTO desde la ListaPartidos
+# =============================================================================
+# Añade a las hojas F7/F11 los equipos NUEVOS (casa y visitante) de las competiciones
+# que interesan, sin duplicar ni perder el ojeo, reordenando por edad. Conserva la
+# macro, los desplegables y el formato (openpyxl keep_vba).
+
+def clasificar_comp(colA):
+    """(modalidad, rank_edad) de una competición; rank menor = más arriba en la hoja.
+    Devuelve (None, None) si no es de las que interesan (futsal, playa, femenino, sénior no-tercera)."""
+    c = _sin_acentos(colA).upper()
+    if any(k in c for k in ['SALA', 'F.S', 'FUTSAL', 'PLAYA', 'FEMENIN']):
+        return None, None
+    if 'PREBENJAMIN' in c: return 'F7', 3
+    if 'BENJAMIN' in c:    return 'F7', 2
+    if 'ALEVIN' in c:      return 'F7', 1
+    if 'INFANTIL' in c:    return 'F11', 3
+    if 'CADETE' in c:      return 'F11', 2
+    if 'JUVENIL' in c:     return 'F11', 1
+    if 'FEDERACION' in c and ('TERCERA' in c or re.search(r'\b3\b|3[ªAº]', c)):
+        return 'F11', 0
+    return None, None
+
+def _num_grupo(colA):
+    m = re.search(r'GRUPO\s+(\d+)', _sin_acentos(colA).upper())
+    return int(m.group(1)) if m else 0
+
+def actualizar_seguimiento(uploaded_excel, df):
+    """Devuelve (BytesIO del .xlsm actualizado, stats) o (None, None) si no aplica."""
+    import openpyxl
+    uploaded_excel.seek(0)
+    wb = openpyxl.load_workbook(uploaded_excel, keep_vba=True)
+    nombres = {h.lower(): h for h in wb.sheetnames}
+    hojas = {'F7': nombres.get('andalucia f7'), 'F11': nombres.get('andalucia f-11')}
+    if not hojas['F7'] and not hojas['F11']:
+        return None, None
+
+    # equipos de la lista de partidos, por modalidad (casa y visitante)
+    nuevos = {'F7': set(), 'F11': set()}
+    for _, r in df.iterrows():
+        comp = str(r.get('Competición', '')).strip()
+        g = r.get('Grupo')
+        grupo = str(g).strip() if pd.notna(g) else ''
+        colA = comp + (', ' + grupo if grupo and grupo.lower() != 'nan' else '')
+        mod, _ = clasificar_comp(colA)
+        if not mod:
+            continue
+        for eqcol in ['Equipo Casa', 'Equipo Visitante']:
+            eq = r.get(eqcol)
+            if pd.notna(eq) and str(eq).strip():
+                nuevos[mod].add((colA, str(eq).strip()))
+
+    stats = {'F7': 0, 'F11': 0}
+    for mod, hoja in hojas.items():
+        if not hoja:
+            continue
+        ws = wb[hoja]
+        maxr = ws.max_row
+        # leer filas existentes conservando el ojeo (columnas D..BE)
+        data = {}
+        for rr in range(8, maxr + 1):
+            c = ws.cell(rr, 3).value
+            if c is not None and str(c).strip():
+                a = ws.cell(rr, 1).value
+                key = (str(a).strip() if a is not None else '', str(c).strip())
+                data[key] = [ws.cell(rr, col).value for col in range(4, 58)]
+        antes = len(data)
+        for key in nuevos[mod]:
+            if key not in data:
+                data[key] = [None] * 54
+        stats[mod] = len(data) - antes
+
+        def clave(k):
+            _, rank = clasificar_comp(k[0])
+            return (rank if rank is not None else 9, _sin_acentos(k[0]).upper(),
+                    _num_grupo(k[0]), _sin_acentos(k[1]).upper())
+        orden = sorted(data.keys(), key=clave)
+
+        # limpiar contenido antiguo (mantiene estilos/bordes/validación) y reescribir
+        for rr in range(8, maxr + 1):
+            for col in [1, 3] + list(range(4, 58)):
+                ws.cell(rr, col).value = None
+        for i, key in enumerate(orden):
+            rr = 8 + i
+            ws.cell(rr, 1).value = key[0]
+            ws.cell(rr, 3).value = key[1]
+            d = data[key]
+            for j, col in enumerate(range(4, 58)):
+                ws.cell(rr, col).value = d[j]
+
+    out = BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out, stats
+
+# =============================================================================
 # TABS
 # =============================================================================
 tab1, tab2 = st.tabs(["📋 Procesar Partidos Nuevos", "🔄 Actualizar Agenda Existente"])
@@ -364,6 +459,23 @@ with tab1:
             cdb.download_button("💾 Descargar tabla maestra actualizada",
                                 data=df_maestro.to_csv(sep=';', index=False, encoding='utf-8-sig').encode('utf-8-sig'),
                                 file_name="maestro_provincias_clubes.csv", mime="text/csv")
+
+            # --- Seguimiento actualizado (añade equipos nuevos de esta lista) ---
+            st.markdown("---")
+            st.subheader("🔄 Seguimiento actualizado")
+            try:
+                with st.spinner('Añadiendo equipos nuevos al seguimiento...'):
+                    seg_out, seg_stats = actualizar_seguimiento(uploaded_excel, df)
+                if seg_out is None:
+                    st.warning("El Excel subido no tiene las hojas 'andalucia f7' / 'andalucia f-11'.")
+                else:
+                    st.success(f"Añadidos **{seg_stats['F7']}** equipos nuevos a F7 y **{seg_stats['F11']}** a F11 "
+                               "(los que no estaban, de las competiciones que interesan). El resto y tu ojeo se conservan.")
+                    st.download_button("📥 Descargar Seguimiento actualizado (.xlsm)", data=seg_out.getvalue(),
+                                       file_name="Seguimiento_ligas_actualizado.xlsm",
+                                       mime="application/vnd.ms-excel.sheet.macroEnabled.12")
+            except Exception as e:
+                st.warning(f"No se pudo actualizar el seguimiento: {e}")
 
         except Exception as e:
             st.error(f"❌ Error al procesar los archivos: {str(e)}")
