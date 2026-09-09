@@ -67,6 +67,22 @@ def info_competicion(competicion):
 def categoria(competicion):
     return info_competicion(competicion)[0]
 
+def modalidad(competicion):
+    """Clasifica el partido en F7 / F11 / OTROS según la competición:
+    - F7    : alevín, benjamín, prebenjamín
+    - F11   : infantil, cadete, juvenil y sénior de Tercera Federación
+    - OTROS : fútbol sala, playa, femenino, sénior no-tercera, copas sin categoría, etc."""
+    c = _sin_acentos(competicion).upper()
+    if any(k in c for k in ['SALA', 'F.S', 'FUTSAL', 'PLAYA', 'FEMENIN']):
+        return 'OTROS'
+    if any(k in c for k in ['ALEVIN', 'BENJAMIN', 'PREBENJAMIN']):
+        return 'F7'
+    if any(k in c for k in ['INFANTIL', 'CADETE', 'JUVENIL']):
+        return 'F11'
+    if 'FEDERACION' in c and ('TERCERA' in c or re.search(r'\b3\b|3[ªAº]', c)):
+        return 'F11'
+    return 'OTROS'
+
 # =============================================================================
 # SEGUIMIENTO (hojas F7 y F11) -> índices para el cruce por nombre
 # =============================================================================
@@ -229,6 +245,7 @@ with tab1:
                 df = lect.copy()
                 df['Competicion'] = (df['Competición'].fillna('') + ", " + df['Grupo'].fillna('')) \
                     .str.strip().str.strip(',').str.strip()
+                df['Modalidad'] = df['Competición'].map(modalidad)
 
                 # 2) SEGUIMIENTO (F7 + F11) + cruce consolidado por nombre
                 registros = leer_seguimiento(uploaded_excel)
@@ -284,7 +301,7 @@ with tab1:
 
                 df['Visto'] = df.apply(calcular_visto, axis=1)
 
-                orden = ['Técnico', 'Motivo', 'Visto', 'Fecha', 'Hora', 'Jornada', 'Competicion', 'Provincia',
+                orden = ['Técnico', 'Motivo', 'Visto', 'Modalidad', 'Fecha', 'Hora', 'Jornada', 'Competicion', 'Provincia',
                          'Nombre Club Casa', 'Equipo Casa', 'Visualización C', 'Detalles Equipo Casa',
                          'Nombre Club Visitante', 'Equipo Visitante', 'Visualización V', 'Detalles Equipo Visitante',
                          'Campo', 'Dirección Campo']
@@ -301,6 +318,10 @@ with tab1:
             c1.metric("📊 Partidos", total)
             c2.metric("🎯 Equipo casa localizado", f"{loc} ({100*loc//max(1,total)}%)")
             c3.metric("🗺️ Con provincia", f"{con_prov} ({100*con_prov//max(1,total)}%)")
+
+            vc_mod = df['Modalidad'].value_counts()
+            st.write("**Reparto por modalidad:** "
+                     + " · ".join(f"{k}: {int(v)}" for k, v in vc_mod.items()))
 
             msg = f"🗂️ Tabla maestra: {len(df_maestro)} clubes ({nuevos} nuevos añadidos esta vez)."
             msg += " Guardada junto a la app." if guardado else " ⚠️ No se pudo guardar localmente; descárgala abajo."
