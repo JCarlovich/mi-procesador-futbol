@@ -166,24 +166,29 @@ def resolver_equipo(por_canon, por_edad, competicion, nombre):
 PROV_DISPLAY = {'GRANADA': 'Granada', 'CADIZ': 'Cádiz', 'JAEN': 'Jaén', 'MALAGA': 'Málaga',
                 'CORDOBA': 'Córdoba', 'ALMERIA': 'Almería', 'SEVILLA': 'Sevilla', 'HUELVA': 'Huelva'}
 
-def provincia_desde_partido(direccion, competicion):
-    """Deduce la provincia mirando la dirección del campo (último trozo tras la coma)
-    y, si no, el nombre de la competición (paréntesis o mención)."""
-    # 1) dirección del campo: "...,  Monachil, Granada"
-    if pd.notna(direccion):
-        ult = _sin_acentos(direccion).upper().split(',')[-1].strip()
-        if ult in PROV_DISPLAY:
-            return PROV_DISPLAY[ult]
-    # 2) competición: "(Granada)" o mención de la provincia
-    if pd.notna(competicion):
-        c = _sin_acentos(competicion).upper()
-        m = re.search(r'\(([^)]*)\)', c)
-        if m and m.group(1).strip() in PROV_DISPLAY:
-            return PROV_DISPLAY[m.group(1).strip()]
-        for k, v in PROV_DISPLAY.items():
-            if re.search(r'\b' + k + r'\b', c):
-                return v
-    return None
+def _buscar_provincia(texto):
+    """Busca cualquier provincia andaluza mencionada en el texto y devuelve su nombre
+    bonito. Si hay varias, la última (suele ser la real: '..., Ciudad, Provincia')."""
+    if pd.isna(texto):
+        return None
+    c = _sin_acentos(texto).upper()
+    hits = [(m.start(), p) for p in PROV_DISPLAY for m in re.finditer(r'\b' + p + r'\b', c)]
+    return PROV_DISPLAY[max(hits)[1]] if hits else None
+
+def provincia_de_direccion(direccion):
+    """Provincia deducida de la dirección del campo (busca en toda la cadena, no solo
+    el último trozo: así aguanta códigos postales o texto tras la provincia)."""
+    return _buscar_provincia(direccion)
+
+def provincia_de_competicion(competicion):
+    """Provincia deducida del nombre de la competición: paréntesis '(Granada)' o mención."""
+    if pd.isna(competicion):
+        return None
+    c = _sin_acentos(competicion).upper()
+    m = re.search(r'\(([^)]*)\)', c)
+    if m and m.group(1).strip() in PROV_DISPLAY:
+        return PROV_DISPLAY[m.group(1).strip()]
+    return _buscar_provincia(competicion)
 
 def cargar_maestro(upload=None):
     """Devuelve (prov_por_codigo, nombre_por_codigo). Prioridad: archivo subido > local."""
@@ -263,27 +268,44 @@ with tab1:
                 df['Detalles Equipo Visitante'] = det_v
                 df['_match_casa'] = match_c
 
-                # 3) PROVINCIA por código de club + tabla maestra
+                # 3) PROVINCIA por código de club + tabla maestra (se guarda y crece sola)
                 prov_map, nom_map = cargar_maestro(uploaded_maestro)
-                maestro_previo = len(prov_map)
 
                 dir_col = 'Dirección Campo' if 'Dirección Campo' in df.columns else None
-                df['_praw'] = df.apply(
-                    lambda r: provincia_desde_partido(r.get(dir_col) if dir_col else np.nan, r.get('Competición')),
-                    axis=1)
+                df['_prov_dir'] = df[dir_col].map(provincia_de_direccion) if dir_col else None
+                df['_prov_comp'] = df['Competición'].map(provincia_de_competicion)
 
-                # completar la maestra con clubes casa nuevos (los que aún no tenía)
+                def _guardar_club(code, nombre, prov):
+                    code = str(code) if pd.notna(code) else ''
+                    if code and prov and code not in prov_map:
+                        prov_map[code] = prov
+                        nom_map[code] = str(nombre) if pd.notna(nombre) else ''
+                        return True
+                    return False
+
                 nuevos = 0
-                for code, grp in df.dropna(subset=['_praw']).groupby('Club Casa'):
-                    code = str(code)
-                    if code and code not in prov_map:
-                        prov_map[code] = grp['_praw'].mode().iat[0]
-                        nombres = grp['Nombre Club Casa'].dropna()
-                        nom_map[code] = nombres.iloc[0] if len(nombres) else ''
+                # club de CASA: provincia por dirección del campo (mejor) o, si no, por competición
+                for code, grp in df.groupby('Club Casa'):
+                    pv = grp['_prov_dir'].dropna()
+                    if len(pv):
+                        prov = pv.mode().iat[0]
+                    else:
+                        pc = grp['_prov_comp'].dropna()
+                        prov = pc.mode().iat[0] if len(pc) else None
+                    nom = grp['Nombre Club Casa'].dropna()
+                    if _guardar_club(code, nom.iloc[0] if len(nom) else '', prov):
                         nuevos += 1
+                # club VISITANTE: solo si la competición indica provincia (ligas provinciales)
+                for code, grp in df.groupby('Club Visitante'):
+                    pc = grp['_prov_comp'].dropna()
+                    if len(pc):
+                        nom = grp['Nombre Club Visitante'].dropna()
+                        if _guardar_club(code, nom.iloc[0] if len(nom) else '', pc.mode().iat[0]):
+                            nuevos += 1
 
-                # asignar: por código de club casa (maestra); si no, la deducida del propio partido
-                df['Provincia'] = df['Club Casa'].astype(str).map(prov_map).fillna(df['_praw'])
+                # provincia del PARTIDO = la del club de casa (maestra > dirección > competición)
+                df['Provincia'] = (df['Club Casa'].astype(str).map(prov_map)
+                                   .fillna(df['_prov_dir']).fillna(df['_prov_comp']))
 
                 # guardar la maestra actualizada
                 df_maestro = maestro_a_df(prov_map, nom_map)
