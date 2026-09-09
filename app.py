@@ -14,6 +14,16 @@ st.title("⚽ Procesador Completo de Partidos de Fútbol")
 DIR_APP = os.path.dirname(os.path.abspath(__file__))
 MAESTRO_PATH = os.path.join(DIR_APP, 'maestro_provincias_clubes.csv')
 
+def _excel_engine():
+    """Usa xlsxwriter si está; si no, openpyxl (evita fallar si falta una librería)."""
+    try:
+        import xlsxwriter  # noqa: F401
+        return 'xlsxwriter'
+    except Exception:
+        return 'openpyxl'
+
+EXCEL_ENGINE = _excel_engine()
+
 # =============================================================================
 # CONSOLIDACIÓN E INTERPRETACIÓN DE NOMBRES (para cruzar con el seguimiento)
 # =============================================================================
@@ -302,7 +312,7 @@ with tab1:
             st.dataframe(df_resultado.head(15))
 
             out = BytesIO()
-            with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
+            with pd.ExcelWriter(out, engine=EXCEL_ENGINE) as writer:
                 df_resultado.to_excel(writer, sheet_name='Resultado', index=False)
             cda, cdb = st.columns(2)
             cda.download_button("📥 Descargar agenda_nueva.xlsx", data=out.getvalue(),
@@ -427,7 +437,7 @@ with tab2:
                         st.subheader("👀 Vista previa del resultado")
                         st.dataframe(df_actualizado.head(10))
                         output_act = BytesIO()
-                        with pd.ExcelWriter(output_act, engine='xlsxwriter') as writer:
+                        with pd.ExcelWriter(output_act, engine=EXCEL_ENGINE) as writer:
                             df_actualizado.to_excel(writer, sheet_name='Agenda_Actualizada', index=False)
                         ts = datetime.now().strftime('%Y%m%d_%H%M')
                         st.download_button("📥 Descargar agenda_actualizada.xlsx", data=output_act.getvalue(),
