@@ -47,8 +47,13 @@ def canon_equipo(nombre):
 def info_competicion(competicion):
     """(edad, tier) de una competición."""
     c = _sin_acentos(competicion).upper()
-    edad = next((k for k in ['PREBENJAMIN', 'BENJAMIN', 'ALEVIN', 'INFANTIL', 'CADETE', 'JUVENIL'] if k in c),
-                'SENIOR' if ('TERCERA' in c or 'SENIOR' in c) else 'OTRO')
+    edad = next((k for k in ['PREBENJAMIN', 'BENJAMIN', 'ALEVIN', 'INFANTIL', 'CADETE', 'JUVENIL'] if k in c), None)
+    if edad is None:
+        # sénior: Tercera Federación escrita como "TERCERA" o como "3ª Federación"
+        if 'SENIOR' in c or 'TERCERA' in c or ('FEDERACION' in c and re.search(r'\b3\b|3[ªAº]', c)):
+            edad = 'SENIOR'
+        else:
+            edad = 'OTRO'
     m = re.search(r'\b([1-5])\b', c)
     if m:
         tier = m.group(1)
