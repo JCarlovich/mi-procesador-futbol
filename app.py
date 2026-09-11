@@ -318,9 +318,138 @@ def actualizar_seguimiento(uploaded_excel, df):
     return out, stats
 
 # =============================================================================
+# VOLCAR OJEO DE LAS AGENDAS AL SEGUIMIENTO  (reemplazo de la macro, con matching bueno)
+# =============================================================================
+def _mapa_jornada_col(ws):
+    """jornada (int) -> nº de columna, leyendo la fila 7 (hay una columna 'Otro' que
+    rompe el orden lineal, por eso se lee de la cabecera en vez de calcularlo)."""
+    m = {}
+    for c in range(1, 58):
+        try:
+            m[int(ws.cell(7, c).value)] = c
+        except (TypeError, ValueError):
+            pass
+    return m
+
+def _indice_volcado(wb):
+    """(edad, canon) -> [{ws,row,suf,tier,sig}] y por_edad, sobre las hojas F7 y F11."""
+    nombres = {h.lower(): h for h in wb.sheetnames}
+    hojas = [nombres[h] for h in HOJAS_SEGUIMIENTO if h in nombres] or \
+            [h for h in wb.sheetnames if h.lower() not in HOJAS_NO_EQUIPOS]
+    idx, por_edad = {}, {}
+    for h in hojas:
+        ws = wb[h]
+        for r in range(8, ws.max_row + 1):
+            eq = ws.cell(r, 3).value
+            if eq is None or not str(eq).strip():
+                continue
+            edad, tier = info_competicion(ws.cell(r, 1).value)
+            cs, suf = canon_equipo(eq)
+            if not cs:
+                continue
+            rec = {'ws': ws, 'row': r, 'suf': suf, 'tier': tier, 'sig': set(cs.split())}
+            idx.setdefault((edad, cs), []).append(rec)
+            por_edad.setdefault(edad, []).append((cs, rec))
+    return idx, por_edad
+
+def _fila_para(idx, por_edad, competicion, nombre):
+    """Igual criterio que resolver_equipo, pero devuelve la fila del seguimiento a escribir."""
+    edad, tier = info_competicion(competicion)
+    cs, suf = canon_equipo(nombre)
+    if not cs:
+        return None
+    cands = idx.get((edad, cs), [])
+    if cands:
+        if len(cands) > 1:
+            f = [x for x in cands if (not suf or not x['suf'] or x['suf'] == suf)] or cands
+            if len(f) > 1:
+                g = [x for x in f if x['tier'] == tier] or f
+                f = g
+            cands = f
+        return cands[0]
+    sig = set(cs.split())
+    mejor, sc, emp = None, 0.0, 0
+    for _c, rec in por_edad.get(edad, []):
+        if suf and rec['suf'] and suf != rec['suf']:
+            continue
+        inter = len(sig & rec['sig'])
+        if not inter:
+            continue
+        j = inter / len(sig | rec['sig'])
+        if j > sc:
+            mejor, sc, emp = rec, j, 1
+        elif j == sc:
+            emp += 1
+    return mejor if (mejor and sc >= 0.6 and emp == 1) else None
+
+def _header_row_agenda(aws):
+    for r in range(1, 16):
+        vals = [str(aws.cell(r, c).value or '').strip().lower() for c in range(1, 14)]
+        if 'jornada' in vals and any('equipo' in v for v in vals):
+            return r
+    return 7
+
+def volcar_agendas(uploaded_seguimiento, agendas):
+    """Mete el ojeo de las agendas rellenadas en el seguimiento (como la macro).
+    Columnas de la agenda: A=técnico, E=jornada, F/G/H=equipo/valoración/comentario local,
+    I/J/K=visitante, L=categoría. Devuelve (BytesIO del .xlsm, stats)."""
+    import openpyxl
+    uploaded_seguimiento.seek(0)
+    wb = openpyxl.load_workbook(uploaded_seguimiento, keep_vba=True)
+    idx, por_edad = _indice_volcado(wb)
+    jcol = {}
+    volcados = 0
+    no_encontrados = []
+    for af in agendas:
+        try:
+            af.seek(0)
+        except Exception:
+            pass
+        awb = openpyxl.load_workbook(af, read_only=True, data_only=True)
+        aws = awb['Agenda'] if 'Agenda' in awb.sheetnames else awb[awb.sheetnames[0]]
+        hr = _header_row_agenda(aws)
+        for row in aws.iter_rows(min_row=hr + 1, values_only=True):
+            if row is None or len(row) < 12:
+                continue
+            tecnico, jornada, categoria = row[0], row[4], row[11]
+            if categoria is None or not str(categoria).strip():
+                continue
+            for (eqi, vali, comi) in [(5, 6, 7), (8, 9, 10)]:
+                eq = row[eqi] if len(row) > eqi else None
+                val = row[vali] if len(row) > vali else None
+                com = row[comi] if len(row) > comi else None
+                if val is None or not str(val).strip() or eq is None or not str(eq).strip():
+                    continue
+                rec = _fila_para(idx, por_edad, categoria, eq)
+                if rec is None:
+                    no_encontrados.append((str(categoria), str(eq)))
+                    continue
+                ws, r = rec['ws'], rec['row']
+                if id(ws) not in jcol:
+                    jcol[id(ws)] = _mapa_jornada_col(ws)
+                try:
+                    jn = int(float(jornada))
+                except (TypeError, ValueError):
+                    jn = None
+                if jn and jn in jcol[id(ws)]:
+                    ws.cell(r, jcol[id(ws)][jn]).value = val
+                for i in range(10):  # primer bloque de visualización libre (AK=37, paso 2)
+                    ccol = 37 + i * 2
+                    if ws.cell(r, ccol).value in (None, ''):
+                        ws.cell(r, ccol).value = tecnico
+                        ws.cell(r, ccol + 1).value = com
+                        break
+                volcados += 1
+    out = BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out, {'volcados': volcados, 'no_encontrados': no_encontrados}
+
+# =============================================================================
 # TABS
 # =============================================================================
-tab1, tab2 = st.tabs(["📋 Procesar Partidos Nuevos", "🔄 Actualizar Agenda Existente"])
+tab1, tab2, tab3 = st.tabs(["📋 Procesar Partidos Nuevos", "🔄 Actualizar Agenda Existente",
+                            "📥 Volcar ojeo al seguimiento"])
 
 with tab1:
     st.header("📋 Crear Agenda Desde Cero")
@@ -609,6 +738,46 @@ with tab2:
             st.error(f"❌ Error al leer los archivos: {str(e)}")
     else:
         st.info("👆 Sube ambos archivos para configurar la actualización")
+
+# =============================================================================
+# TAB 3: VOLCAR OJEO DE LAS AGENDAS AL SEGUIMIENTO (reemplaza la macro)
+# =============================================================================
+with tab3:
+    st.header("📥 Volcar ojeo al seguimiento")
+    st.markdown("Mete en el seguimiento las **valoraciones y jugadores destacados** de las agendas que "
+                "han rellenado los técnicos. Reemplaza la macro y cruza los nombres de forma inteligente "
+                "(por edad + nombre consolidado), en las dos hojas.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("📊 Seguimiento")
+        seg_v = st.file_uploader("Sube el seguimiento (.xlsm)", type=['xlsx', 'xlsm'], key="seg_volcado")
+    with c2:
+        st.subheader("📝 Agendas rellenadas")
+        agendas_v = st.file_uploader("Sube una o varias agendas (hoja 'Agenda' con técnico/valoración/equipo)",
+                                     type=['xlsx', 'xlsm'], accept_multiple_files=True, key="agendas_volcado")
+
+    if seg_v is not None and agendas_v:
+        if st.button("📥 Volcar al seguimiento", type="primary"):
+            try:
+                with st.spinner('Volcando el ojeo al seguimiento...'):
+                    seg_out, seg_stats = volcar_agendas(seg_v, agendas_v)
+                nenc = seg_stats['no_encontrados']
+                st.success(f"✅ Volcadas **{seg_stats['volcados']}** valoraciones al seguimiento.")
+                if nenc:
+                    st.warning(f"⚠️ {len(nenc)} equipos de las agendas no se encontraron en el seguimiento "
+                               "(nombre/categoría que no casa, o equipo aún no dado de alta).")
+                    with st.expander(f"Ver {len(nenc)} no encontrados"):
+                        st.dataframe(pd.DataFrame(nenc, columns=['Categoría', 'Equipo']).drop_duplicates()
+                                     .reset_index(drop=True))
+                st.download_button("📥 Descargar seguimiento con el ojeo (.xlsm)", data=seg_out.getvalue(),
+                                   file_name="Seguimiento_ligas_actualizado.xlsm",
+                                   mime="application/vnd.ms-excel.sheet.macroEnabled.12")
+            except Exception as e:
+                st.error(f"❌ Error al volcar: {str(e)}")
+                st.exception(e)
+    else:
+        st.info("👆 Sube el seguimiento y al menos una agenda rellenada por los técnicos.")
 
 # =============================================================================
 # SIDEBAR
