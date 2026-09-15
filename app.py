@@ -173,7 +173,9 @@ def resolver_equipo(por_canon, por_edad, competicion, nombre):
 # se asigna por código y se guarda. Así no hay que recalcular nada en el futuro.
 
 PROV_DISPLAY = {'GRANADA': 'Granada', 'CADIZ': 'Cádiz', 'JAEN': 'Jaén', 'MALAGA': 'Málaga',
-                'CORDOBA': 'Córdoba', 'ALMERIA': 'Almería', 'SEVILLA': 'Sevilla', 'HUELVA': 'Huelva'}
+                'CORDOBA': 'Córdoba', 'ALMERIA': 'Almería', 'SEVILLA': 'Sevilla', 'HUELVA': 'Huelva',
+                # Ceuta y Melilla no son provincias andaluzas, pero se juegan partidos alli
+                'CEUTA': 'Ceuta', 'MELILLA': 'Melilla'}
 
 def _buscar_provincia(texto):
     """Busca cualquier provincia andaluza mencionada en el texto y devuelve su nombre
@@ -547,9 +549,22 @@ with tab1:
                         if _guardar_club(code, nom.iloc[0] if len(nom) else '', pc.mode().iat[0]):
                             nuevos += 1
 
-                # provincia del PARTIDO = la del club de casa (maestra > dirección > competición)
+                # Respaldo por NOMBRE de club: algunas filas vienen SIN codigo de club
+                # (p.ej. Division de Honor Juvenil), asi que no sirve la busqueda por codigo.
+                prov_por_nombre = {}
+                for _cod, _nb in nom_map.items():
+                    _cs, _ = canon_equipo(_nb)
+                    if _cs and _cod in prov_map:
+                        prov_por_nombre.setdefault(_cs, prov_map[_cod])
+                _por_nombre = df['Nombre Club Casa'].map(
+                    lambda x: prov_por_nombre.get(canon_equipo(x)[0]) if pd.notna(x) else None)                     if 'Nombre Club Casa' in df.columns else None
+
+                # provincia del PARTIDO: maestra por codigo > direccion > maestra por nombre > competicion
                 df['Provincia'] = (df['Club Casa'].astype(str).map(prov_map)
-                                   .fillna(df['_prov_dir']).fillna(df['_prov_comp']))
+                                   .fillna(df['_prov_dir']))
+                if _por_nombre is not None:
+                    df['Provincia'] = df['Provincia'].fillna(_por_nombre)
+                df['Provincia'] = df['Provincia'].fillna(df['_prov_comp'])
 
                 # guardar la maestra actualizada
                 df_maestro = maestro_a_df(prov_map, nom_map)
