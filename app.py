@@ -42,6 +42,10 @@ def canon_equipo(nombre):
     suf = m.group(1) if m else ''
     s = re.sub(r'[^A-Z0-9 ]', ' ', s)
     sig = [t for t in s.split() if t not in STOP and len(t) > 1]
+    if not sig:
+        # Nombres formados solo por iniciales (ej. "C.D. T.A.E."): si el filtrado deja
+        # el nombre vacio, se usa el nombre completo sin filtrar para no perder el equipo.
+        sig = [t for t in s.split() if t]
     return ' '.join(sig), suf
 
 def info_competicion(competicion):
