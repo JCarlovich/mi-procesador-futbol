@@ -58,19 +58,20 @@ def info_competicion(competicion):
             edad = 'SENIOR'
         else:
             edad = 'OTRO'
-    m = re.search(r'\b([1-5])\b', c)
-    if m:
-        tier = m.group(1)
-    elif 'HONOR' in c:
+    # El ", Grupo N" NO es el nivel: hay que quitarlo o "Division de Honor Juvenil,
+    # Grupo 4" se leeria como nivel 4 en vez de DH y no casaria con la lista.
+    cs_ = re.sub(',? *GRUPO.*$', '', c).strip()
+    _tok = [t for t in re.split('[^A-Z0-9]+', cs_) if t]
+    if 'HONOR' in cs_:
         tier = 'DH'
-    elif 'LIGA NACIONAL' in c:
+    elif 'LIGA NACIONAL' in cs_:
         tier = 'LN'
-    elif 'TERCERA' in c:
+    elif 'TERCERA' in cs_ or ('FEDERACION' in cs_ and '3' in _tok):
         tier = 'TF'
-    elif 'COPA' in c or 'TROFEO' in c:
+    elif 'COPA' in cs_ or 'TROFEO' in cs_:
         tier = 'CP'
     else:
-        tier = 'X'
+        tier = next((t for t in _tok if t in ('1', '2', '3', '4', '5')), 'X')
     return edad, tier
 
 def categoria(competicion):
@@ -91,6 +92,30 @@ def modalidad(competicion):
     if 'FEDERACION' in c and ('TERCERA' in c or re.search(r'\b3\b|3[ªAº]', c)):
         return 'F11'
     return 'OTROS'
+
+def _norm_comp(competicion):
+    """Competicion normalizada para comparar la col A del seguimiento con la
+    'Competicion, Grupo' de la lista de partidos (salen de la misma fuente)."""
+    if pd.isna(competicion):
+        return ''
+    return ' '.join(_sin_acentos(competicion).upper().split()).strip().strip(',').strip()
+
+def estado_visto(vis_casa, vis_visitante):
+    """Estado de ojeo del partido segun que equipos ya tienen visualizacion:
+    'Rellenas'       -> los dos equipos ya han sido ojeados
+    'Solo casa'      -> solo el equipo local
+    'Solo visitante' -> solo el visitante
+    'Incompletas'    -> ninguno de los dos"""
+    a = str(vis_casa).strip() if pd.notna(vis_casa) else ''
+    b = str(vis_visitante).strip() if pd.notna(vis_visitante) else ''
+    if a and b:
+        return 'Rellenas'
+    if a:
+        return 'Solo casa'
+    if b:
+        return 'Solo visitante'
+    return 'Incompletas'
+
 
 # =============================================================================
 # SEGUIMIENTO (hojas F7 y F11) -> índices para el cruce por nombre
@@ -121,6 +146,7 @@ def leer_seguimiento(archivo):
             if not cs:
                 continue
             registros.append({'edad': edad, 'tier': tier, 'canon': cs, 'suf': suf,
+                              'comp': _norm_comp(r.iloc[0]),
                               'sig': set(cs.split()), 'vis': r.iloc[36], 'det': r.iloc[35],
                               'equipo': str(equipo)})
     return registros
@@ -132,7 +158,7 @@ def construir_indices(registros):
         por_edad.setdefault(rec['edad'], []).append(rec)
     return por_canon, por_edad
 
-def resolver_equipo(por_canon, por_edad, competicion, nombre):
+def resolver_equipo(por_canon, por_edad, competicion, nombre, comp_completa=None):
     edad, tier = info_competicion(competicion)
     cs, suf = canon_equipo(nombre)
     if not cs:
@@ -140,10 +166,16 @@ def resolver_equipo(por_canon, por_edad, competicion, nombre):
     cands = por_canon.get((edad, cs), [])
     if cands:
         if len(cands) > 1:
-            f = [x for x in cands if (not suf or not x['suf'] or x['suf'] == suf)] or cands
+            # 1o por competicion completa (con grupo): es identica en ambos lados
+            cc = _norm_comp(comp_completa) if comp_completa is not None else ''
+            f = [x for x in cands if cc and x['comp'] == cc] or cands
             if len(f) > 1:
-                g = [x for x in f if x['tier'] == tier] or f
-                f = g
+                f = [x for x in f if (not suf or not x['suf'] or x['suf'] == suf)] or f
+            if len(f) > 1:
+                f = [x for x in f if x['tier'] == tier] or f
+            if len(f) > 1:
+                # a igualdad, el que ya tiene ojeo (es el informativo)
+                f = [x for x in f if pd.notna(x['vis']) and str(x['vis']).strip()] or f
             cands = f
         return cands[0]['vis'], cands[0]['det']
     # fuzzy conservador dentro de la edad
@@ -353,7 +385,8 @@ def _indice_volcado(wb):
             cs, suf = canon_equipo(eq)
             if not cs:
                 continue
-            rec = {'ws': ws, 'row': r, 'suf': suf, 'tier': tier, 'sig': set(cs.split())}
+            rec = {'ws': ws, 'row': r, 'suf': suf, 'tier': tier, 'sig': set(cs.split()),
+                   'comp': _norm_comp(ws.cell(r, 1).value)}
             idx.setdefault((edad, cs), []).append(rec)
             por_edad.setdefault(edad, []).append((cs, rec))
     return idx, por_edad
@@ -367,10 +400,13 @@ def _fila_para(idx, por_edad, competicion, nombre):
     cands = idx.get((edad, cs), [])
     if cands:
         if len(cands) > 1:
-            f = [x for x in cands if (not suf or not x['suf'] or x['suf'] == suf)] or cands
+            # la categoria de la agenda ya es "Competicion, Grupo": desempata exacto
+            cc = _norm_comp(competicion)
+            f = [x for x in cands if cc and x['comp'] == cc] or cands
             if len(f) > 1:
-                g = [x for x in f if x['tier'] == tier] or f
-                f = g
+                f = [x for x in f if (not suf or not x['suf'] or x['suf'] == suf)] or f
+            if len(f) > 1:
+                f = [x for x in f if x['tier'] == tier] or f
             cands = f
         return cands[0]
     sig = set(cs.split())
@@ -504,8 +540,9 @@ with tab1:
                 vis_c, det_c, match_c, vis_v, det_v = [], [], [], [], []
                 for _, row in df.iterrows():
                     comp = row.get('Competición', '')
-                    vc, dc = resolver_equipo(por_canon, por_edad, comp, row.get('Equipo Casa', ''))
-                    vv, dv = resolver_equipo(por_canon, por_edad, comp, row.get('Equipo Visitante', ''))
+                    compfull = row.get('Competicion', '')
+                    vc, dc = resolver_equipo(por_canon, por_edad, comp, row.get('Equipo Casa', ''), compfull)
+                    vv, dv = resolver_equipo(por_canon, por_edad, comp, row.get('Equipo Visitante', ''), compfull)
                     vis_c.append(vc); det_c.append(dc); match_c.append(vc is not None or dc is not None)
                     vis_v.append(vv); det_v.append(dv)
                 df['Visualización C'] = vis_c
@@ -574,13 +611,8 @@ with tab1:
                 df['Técnico'] = ''
                 df['Motivo'] = ''
 
-                def calcular_visto(row):
-                    vc = row.get('Visualización C', ''); vv = row.get('Visualización V', '')
-                    vc = str(vc) if pd.notna(vc) else ''
-                    vv = str(vv) if pd.notna(vv) else ''
-                    return 'Rellenas' if (vc != '' and vv != '') else 'Incompletas'
-
-                df['Visto'] = df.apply(calcular_visto, axis=1)
+                df['Visto'] = df.apply(
+                    lambda r: estado_visto(r.get('Visualización C'), r.get('Visualización V')), axis=1)
 
                 orden = ['Técnico', 'Motivo', 'Visto', 'Modalidad', 'Fecha', 'Hora', 'Jornada', 'Competicion', 'Provincia',
                          'Nombre Club Casa', 'Equipo Casa', 'Visualización C', 'Detalles Equipo Casa',
@@ -726,9 +758,7 @@ with tab2:
                                             if 'Visto' in df_resultado.columns:
                                                 vc = df_resultado.loc[idx_m, 'Visualización C'] if 'Visualización C' in df_resultado.columns else ''
                                                 vv = df_resultado.loc[idx_m, 'Visualización V'] if 'Visualización V' in df_resultado.columns else ''
-                                                vc = str(vc) if pd.notna(vc) else ''
-                                                vv = str(vv) if pd.notna(vv) else ''
-                                                df_resultado.loc[idx_m, 'Visto'] = 'Rellenas' if (vc != '' and vv != '') else 'Incompletas'
+                                                df_resultado.loc[idx_m, 'Visto'] = estado_visto(vc, vv)
                                     else:
                                         partidos_sin_match += 1
                                 if columna_id == '_posicion_fila':
@@ -815,8 +845,8 @@ with st.sidebar:
     - Sube el **CSV de partidos** y el **Seguimiento** (hojas *andalucia f7* y *andalucia f-11*)
     - Los equipos se cruzan **consolidando nombres** (ignora comillas, C.D./C.F./SAD, sufijos A/B/C…)
     - La **provincia** se deduce del partido (dirección/competición) y se guarda por **código de club** en una **tabla maestra** que crece sola
-    - Se crean: **Técnico**, **Motivo** (vacías) y **Visto** (🟢 Rellenas / 🔴 Incompletas)
+    - Se crean: **Técnico**, **Motivo** (vacías) y **Visto**: 🟢 Rellenas (los dos ojeados) · 🟡 Solo casa · 🟡 Solo visitante · 🔴 Incompletas
     """)
     st.subheader("🔄 Actualizar Agenda")
     st.markdown("- Sube agenda actual + agenda nueva. **Técnico/Motivo/Visto se preservan.**")
-    st.info("🧮 Visto = SI(Y(VisC<>\"\"; VisV<>\"\"); \"Rellenas\"; \"Incompletas\")")
+    st.info("🧮 Visto: Rellenas (los 2 ojeados) · Solo casa · Solo visitante · Incompletas (ninguno)")
