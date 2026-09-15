@@ -1,6 +1,9 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import unicodedata
+import re
+import os
 from io import BytesIO
 from datetime import datetime
 
@@ -8,415 +11,842 @@ st.set_page_config(page_title="Procesador de Partidos", page_icon="⚽", layout=
 
 st.title("⚽ Procesador Completo de Partidos de Fútbol")
 
-# Crear tabs para las diferentes funcionalidades
-tab1, tab2 = st.tabs(["📋 Procesar Partidos Nuevos", "🔄 Actualizar Agenda Existente"])
+DIR_APP = os.path.dirname(os.path.abspath(__file__))
+MAESTRO_PATH = os.path.join(DIR_APP, 'maestro_provincias_clubes.csv')
+
+def _excel_engine():
+    """Usa xlsxwriter si está; si no, openpyxl (evita fallar si falta una librería)."""
+    try:
+        import xlsxwriter  # noqa: F401
+        return 'xlsxwriter'
+    except Exception:
+        return 'openpyxl'
+
+EXCEL_ENGINE = _excel_engine()
 
 # =============================================================================
-# TAB 1: PROCESAMIENTO DE PARTIDOS NUEVOS
+# CONSOLIDACIÓN E INTERPRETACIÓN DE NOMBRES (para cruzar con el seguimiento)
 # =============================================================================
+TOKENS_TIPO = {'CD', 'CF', 'SAD', 'UD', 'AD', 'EF', 'FC', 'CP', 'SD', 'CDE', 'CFB'}
+STOP = {'CLUB', 'ASOCIACION', 'SOCIEDAD', 'ANONIMA', 'DE', 'DEL', 'LA', 'EL', 'LOS', 'LAS', 'Y'} | TOKENS_TIPO
+
+def _sin_acentos(s):
+    return ''.join(c for c in unicodedata.normalize('NFD', str(s)) if unicodedata.category(c) != 'Mn')
+
+def canon_equipo(nombre):
+    """(canónico, sufijo) de un nombre de equipo: sin acentos, sin comillas, sin
+    abreviaturas de tipo de club, con la letra de filial (A/B/C) aparte."""
+    s = _sin_acentos(nombre).upper()
+    s = re.sub(r'["\'‘’“”`]', ' ', s)
+    m = re.search(r'\b([A-E])\b\s*$', s.strip())
+    suf = m.group(1) if m else ''
+    s = re.sub(r'[^A-Z0-9 ]', ' ', s)
+    sig = [t for t in s.split() if t not in STOP and len(t) > 1]
+    if not sig:
+        # Nombres formados solo por iniciales (ej. "C.D. T.A.E."): si el filtrado deja
+        # el nombre vacio, se usa el nombre completo sin filtrar para no perder el equipo.
+        sig = [t for t in s.split() if t]
+    return ' '.join(sig), suf
+
+def info_competicion(competicion):
+    """(edad, tier) de una competición."""
+    c = _sin_acentos(competicion).upper()
+    edad = next((k for k in ['PREBENJAMIN', 'BENJAMIN', 'ALEVIN', 'INFANTIL', 'CADETE', 'JUVENIL'] if k in c), None)
+    if edad is None:
+        # sénior: Tercera Federación escrita como "TERCERA" o como "3ª Federación"
+        if 'SENIOR' in c or 'TERCERA' in c or ('FEDERACION' in c and re.search(r'\b3\b|3[ªAº]', c)):
+            edad = 'SENIOR'
+        else:
+            edad = 'OTRO'
+    # El ", Grupo N" NO es el nivel: hay que quitarlo o "Division de Honor Juvenil,
+    # Grupo 4" se leeria como nivel 4 en vez de DH y no casaria con la lista.
+    cs_ = re.sub(',? *GRUPO.*$', '', c).strip()
+    _tok = [t for t in re.split('[^A-Z0-9]+', cs_) if t]
+    if 'HONOR' in cs_:
+        tier = 'DH'
+    elif 'LIGA NACIONAL' in cs_:
+        tier = 'LN'
+    elif 'TERCERA' in cs_ or ('FEDERACION' in cs_ and '3' in _tok):
+        tier = 'TF'
+    elif 'COPA' in cs_ or 'TROFEO' in cs_:
+        tier = 'CP'
+    else:
+        tier = next((t for t in _tok if t in ('1', '2', '3', '4', '5')), 'X')
+    return edad, tier
+
+def categoria(competicion):
+    return info_competicion(competicion)[0]
+
+def modalidad(competicion):
+    """Clasifica el partido en F7 / F11 / OTROS según la competición:
+    - F7    : alevín, benjamín, prebenjamín
+    - F11   : infantil, cadete, juvenil y sénior de Tercera Federación
+    - OTROS : fútbol sala, playa, femenino, sénior no-tercera, copas sin categoría, etc."""
+    c = _sin_acentos(competicion).upper()
+    if any(k in c for k in ['SALA', 'F.S', 'FUTSAL', 'PLAYA', 'FEMENIN']):
+        return 'OTROS'
+    if any(k in c for k in ['ALEVIN', 'BENJAMIN', 'PREBENJAMIN']):
+        return 'F7'
+    if any(k in c for k in ['INFANTIL', 'CADETE', 'JUVENIL']):
+        return 'F11'
+    if 'FEDERACION' in c and ('TERCERA' in c or re.search(r'\b3\b|3[ªAº]', c)):
+        return 'F11'
+    return 'OTROS'
+
+def _norm_comp(competicion):
+    """Competicion normalizada para comparar la col A del seguimiento con la
+    'Competicion, Grupo' de la lista de partidos (salen de la misma fuente)."""
+    if pd.isna(competicion):
+        return ''
+    return ' '.join(_sin_acentos(competicion).upper().split()).strip().strip(',').strip()
+
+def estado_visto(vis_casa, vis_visitante):
+    """Estado de ojeo del partido segun que equipos ya tienen visualizacion:
+    'Rellenas'       -> los dos equipos ya han sido ojeados
+    'Solo casa'      -> solo el equipo local
+    'Solo visitante' -> solo el visitante
+    'Incompletas'    -> ninguno de los dos"""
+    a = str(vis_casa).strip() if pd.notna(vis_casa) else ''
+    b = str(vis_visitante).strip() if pd.notna(vis_visitante) else ''
+    if a and b:
+        return 'Rellenas'
+    if a:
+        return 'Solo casa'
+    if b:
+        return 'Solo visitante'
+    return 'Incompletas'
+
+
+# =============================================================================
+# SEGUIMIENTO (hojas F7 y F11) -> índices para el cruce por nombre
+# =============================================================================
+HOJAS_SEGUIMIENTO = ['andalucia f7', 'andalucia f-11']
+HOJAS_NO_EQUIPOS = ['pdte ver', 'informesinsertados', 'añadir', 'anadir']
+
+def leer_seguimiento(archivo):
+    xl = pd.ExcelFile(archivo)
+    nombres = {h.lower(): h for h in xl.sheet_names}
+    hojas = [nombres[h] for h in HOJAS_SEGUIMIENTO if h in nombres]
+    if not hojas:
+        hojas = [h for h in xl.sheet_names if h.lower() not in HOJAS_NO_EQUIPOS]
+    if not hojas:
+        hojas = xl.sheet_names[:1]
+    registros = []
+    for h in hojas:
+        d = pd.read_excel(xl, sheet_name=h, header=None)
+        if d.shape[1] <= 36:
+            continue
+        d = d.iloc[7:]
+        for _, r in d.iterrows():
+            equipo = r.iloc[2]
+            if pd.isna(equipo) or not str(equipo).strip():
+                continue
+            edad, tier = info_competicion(r.iloc[0])
+            cs, suf = canon_equipo(equipo)
+            if not cs:
+                continue
+            registros.append({'edad': edad, 'tier': tier, 'canon': cs, 'suf': suf,
+                              'comp': _norm_comp(r.iloc[0]),
+                              'sig': set(cs.split()), 'vis': r.iloc[36], 'det': r.iloc[35],
+                              'equipo': str(equipo)})
+    return registros
+
+def construir_indices(registros):
+    por_canon, por_edad = {}, {}
+    for rec in registros:
+        por_canon.setdefault((rec['edad'], rec['canon']), []).append(rec)
+        por_edad.setdefault(rec['edad'], []).append(rec)
+    return por_canon, por_edad
+
+def resolver_equipo(por_canon, por_edad, competicion, nombre, comp_completa=None):
+    edad, tier = info_competicion(competicion)
+    cs, suf = canon_equipo(nombre)
+    if not cs:
+        return None, None
+    cands = por_canon.get((edad, cs), [])
+    if cands:
+        if len(cands) > 1:
+            # 1o por competicion completa (con grupo): es identica en ambos lados
+            cc = _norm_comp(comp_completa) if comp_completa is not None else ''
+            f = [x for x in cands if cc and x['comp'] == cc] or cands
+            if len(f) > 1:
+                f = [x for x in f if (not suf or not x['suf'] or x['suf'] == suf)] or f
+            if len(f) > 1:
+                f = [x for x in f if x['tier'] == tier] or f
+            if len(f) > 1:
+                # a igualdad, el que ya tiene ojeo (es el informativo)
+                f = [x for x in f if pd.notna(x['vis']) and str(x['vis']).strip()] or f
+            cands = f
+        return cands[0]['vis'], cands[0]['det']
+    # fuzzy conservador dentro de la edad
+    sig = set(cs.split())
+    mejor, mejor_sc, empates = None, 0.0, 0
+    for x in por_edad.get(edad, []):
+        if suf and x['suf'] and suf != x['suf']:
+            continue
+        inter = len(sig & x['sig'])
+        if inter == 0:
+            continue
+        jac = inter / len(sig | x['sig'])
+        if jac > mejor_sc:
+            mejor, mejor_sc, empates = x, jac, 1
+        elif jac == mejor_sc:
+            empates += 1
+    if mejor and mejor_sc >= 0.6 and empates == 1:
+        return mejor['vis'], mejor['det']
+    return None, None
+
+# =============================================================================
+# PROVINCIA por CÓDIGO DE CLUB + TABLA MAESTRA (código club -> provincia)
+# =============================================================================
+# La provincia se deduce del propio partido (dirección del campo y/o competición),
+# se asocia al CÓDIGO de club casa (identificador exacto) y se guarda en una tabla
+# maestra que crece sola. En cada ejecución: se carga, se completa con clubes nuevos,
+# se asigna por código y se guarda. Así no hay que recalcular nada en el futuro.
+
+PROV_DISPLAY = {'GRANADA': 'Granada', 'CADIZ': 'Cádiz', 'JAEN': 'Jaén', 'MALAGA': 'Málaga',
+                'CORDOBA': 'Córdoba', 'ALMERIA': 'Almería', 'SEVILLA': 'Sevilla', 'HUELVA': 'Huelva',
+                # Ceuta y Melilla no son provincias andaluzas, pero se juegan partidos alli
+                'CEUTA': 'Ceuta', 'MELILLA': 'Melilla'}
+
+def _buscar_provincia(texto):
+    """Busca cualquier provincia andaluza mencionada en el texto y devuelve su nombre
+    bonito. Si hay varias, la última (suele ser la real: '..., Ciudad, Provincia')."""
+    if pd.isna(texto):
+        return None
+    c = _sin_acentos(texto).upper()
+    hits = [(m.start(), p) for p in PROV_DISPLAY for m in re.finditer(r'\b' + p + r'\b', c)]
+    return PROV_DISPLAY[max(hits)[1]] if hits else None
+
+def provincia_de_direccion(direccion):
+    """Provincia deducida de la dirección del campo (busca en toda la cadena, no solo
+    el último trozo: así aguanta códigos postales o texto tras la provincia)."""
+    return _buscar_provincia(direccion)
+
+def provincia_de_competicion(competicion):
+    """Provincia deducida del nombre de la competición: paréntesis '(Granada)' o mención."""
+    if pd.isna(competicion):
+        return None
+    c = _sin_acentos(competicion).upper()
+    m = re.search(r'\(([^)]*)\)', c)
+    if m and m.group(1).strip() in PROV_DISPLAY:
+        return PROV_DISPLAY[m.group(1).strip()]
+    return _buscar_provincia(competicion)
+
+def cargar_maestro(upload=None):
+    """Devuelve (prov_por_codigo, nombre_por_codigo). Prioridad: archivo subido > local."""
+    try:
+        if upload is not None:
+            m = pd.read_csv(upload, sep=';', dtype=str, encoding='utf-8-sig')
+        elif os.path.exists(MAESTRO_PATH):
+            m = pd.read_csv(MAESTRO_PATH, sep=';', dtype=str, encoding='utf-8-sig')
+        else:
+            return {}, {}
+        prov = {str(k): v for k, v in zip(m['Codigo Club'], m['Provincia']) if pd.notna(v)}
+        nom = {str(k): (v if pd.notna(v) else '') for k, v in zip(m['Codigo Club'], m.get('Nombre Club', pd.Series([''] * len(m))))}
+        return prov, nom
+    except Exception:
+        return {}, {}
+
+def maestro_a_df(prov_map, nom_map):
+    return pd.DataFrame({'Codigo Club': list(prov_map.keys()),
+                         'Provincia': [prov_map[k] for k in prov_map],
+                         'Nombre Club': [nom_map.get(k, '') for k in prov_map]}).sort_values('Codigo Club')
+
+def guardar_maestro(df_maestro):
+    try:
+        df_maestro.to_csv(MAESTRO_PATH, sep=';', index=False, encoding='utf-8-sig')
+        return True
+    except Exception:
+        return False
+
+# =============================================================================
+# ACTUALIZAR EQUIPOS DEL SEGUIMIENTO desde la ListaPartidos
+# =============================================================================
+# Añade a las hojas F7/F11 los equipos NUEVOS (casa y visitante) de las competiciones
+# que interesan, sin duplicar ni perder el ojeo, reordenando por edad. Conserva la
+# macro, los desplegables y el formato (openpyxl keep_vba).
+
+def clasificar_comp(colA):
+    """(modalidad, rank_edad) de una competición; rank menor = más arriba en la hoja.
+    Devuelve (None, None) si no es de las que interesan (futsal, playa, femenino, sénior no-tercera)."""
+    c = _sin_acentos(colA).upper()
+    if any(k in c for k in ['SALA', 'F.S', 'FUTSAL', 'PLAYA', 'FEMENIN']):
+        return None, None
+    if 'PREBENJAMIN' in c: return 'F7', 3
+    if 'BENJAMIN' in c:    return 'F7', 2
+    if 'ALEVIN' in c:      return 'F7', 1
+    if 'INFANTIL' in c:    return 'F11', 3
+    if 'CADETE' in c:      return 'F11', 2
+    if 'JUVENIL' in c:     return 'F11', 1
+    if 'FEDERACION' in c and ('TERCERA' in c or re.search(r'\b3\b|3[ªAº]', c)):
+        return 'F11', 0
+    return None, None
+
+def _num_grupo(colA):
+    m = re.search(r'GRUPO\s+(\d+)', _sin_acentos(colA).upper())
+    return int(m.group(1)) if m else 0
+
+def actualizar_seguimiento(uploaded_excel, df):
+    """Devuelve (BytesIO del .xlsm actualizado, stats) o (None, None) si no aplica."""
+    import openpyxl
+    uploaded_excel.seek(0)
+    wb = openpyxl.load_workbook(uploaded_excel, keep_vba=True)
+    nombres = {h.lower(): h for h in wb.sheetnames}
+    hojas = {'F7': nombres.get('andalucia f7'), 'F11': nombres.get('andalucia f-11')}
+    if not hojas['F7'] and not hojas['F11']:
+        return None, None
+
+    # equipos de la lista de partidos, por modalidad (casa y visitante)
+    nuevos = {'F7': set(), 'F11': set()}
+    for _, r in df.iterrows():
+        comp = str(r.get('Competición', '')).strip()
+        g = r.get('Grupo')
+        grupo = str(g).strip() if pd.notna(g) else ''
+        colA = comp + (', ' + grupo if grupo and grupo.lower() != 'nan' else '')
+        mod, _ = clasificar_comp(colA)
+        if not mod:
+            continue
+        for eqcol in ['Equipo Casa', 'Equipo Visitante']:
+            eq = r.get(eqcol)
+            if pd.notna(eq) and str(eq).strip():
+                nuevos[mod].add((colA, str(eq).strip()))
+
+    stats = {'F7': 0, 'F11': 0}
+    for mod, hoja in hojas.items():
+        if not hoja:
+            continue
+        ws = wb[hoja]
+        maxr = ws.max_row
+        # leer filas existentes conservando el ojeo (columnas D..BE)
+        data = {}
+        for rr in range(8, maxr + 1):
+            c = ws.cell(rr, 3).value
+            if c is not None and str(c).strip():
+                a = ws.cell(rr, 1).value
+                key = (str(a).strip() if a is not None else '', str(c).strip())
+                data[key] = [ws.cell(rr, col).value for col in range(4, 58)]
+        antes = len(data)
+        for key in nuevos[mod]:
+            if key not in data:
+                data[key] = [None] * 54
+        stats[mod] = len(data) - antes
+
+        def clave(k):
+            _, rank = clasificar_comp(k[0])
+            return (rank if rank is not None else 9, _sin_acentos(k[0]).upper(),
+                    _num_grupo(k[0]), _sin_acentos(k[1]).upper())
+        orden = sorted(data.keys(), key=clave)
+
+        # limpiar contenido antiguo (mantiene estilos/bordes/validación) y reescribir
+        for rr in range(8, maxr + 1):
+            for col in [1, 3] + list(range(4, 58)):
+                ws.cell(rr, col).value = None
+        for i, key in enumerate(orden):
+            rr = 8 + i
+            ws.cell(rr, 1).value = key[0]
+            ws.cell(rr, 3).value = key[1]
+            d = data[key]
+            for j, col in enumerate(range(4, 58)):
+                ws.cell(rr, col).value = d[j]
+
+    out = BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out, stats
+
+# =============================================================================
+# VOLCAR OJEO DE LAS AGENDAS AL SEGUIMIENTO  (reemplazo de la macro, con matching bueno)
+# =============================================================================
+def _mapa_jornada_col(ws):
+    """jornada (int) -> nº de columna, leyendo la fila 7 (hay una columna 'Otro' que
+    rompe el orden lineal, por eso se lee de la cabecera en vez de calcularlo)."""
+    m = {}
+    for c in range(1, 58):
+        try:
+            m[int(ws.cell(7, c).value)] = c
+        except (TypeError, ValueError):
+            pass
+    return m
+
+def _indice_volcado(wb):
+    """(edad, canon) -> [{ws,row,suf,tier,sig}] y por_edad, sobre las hojas F7 y F11."""
+    nombres = {h.lower(): h for h in wb.sheetnames}
+    hojas = [nombres[h] for h in HOJAS_SEGUIMIENTO if h in nombres] or \
+            [h for h in wb.sheetnames if h.lower() not in HOJAS_NO_EQUIPOS]
+    idx, por_edad = {}, {}
+    for h in hojas:
+        ws = wb[h]
+        for r in range(8, ws.max_row + 1):
+            eq = ws.cell(r, 3).value
+            if eq is None or not str(eq).strip():
+                continue
+            edad, tier = info_competicion(ws.cell(r, 1).value)
+            cs, suf = canon_equipo(eq)
+            if not cs:
+                continue
+            rec = {'ws': ws, 'row': r, 'suf': suf, 'tier': tier, 'sig': set(cs.split()),
+                   'comp': _norm_comp(ws.cell(r, 1).value)}
+            idx.setdefault((edad, cs), []).append(rec)
+            por_edad.setdefault(edad, []).append((cs, rec))
+    return idx, por_edad
+
+def _fila_para(idx, por_edad, competicion, nombre):
+    """Igual criterio que resolver_equipo, pero devuelve la fila del seguimiento a escribir."""
+    edad, tier = info_competicion(competicion)
+    cs, suf = canon_equipo(nombre)
+    if not cs:
+        return None
+    cands = idx.get((edad, cs), [])
+    if cands:
+        if len(cands) > 1:
+            # la categoria de la agenda ya es "Competicion, Grupo": desempata exacto
+            cc = _norm_comp(competicion)
+            f = [x for x in cands if cc and x['comp'] == cc] or cands
+            if len(f) > 1:
+                f = [x for x in f if (not suf or not x['suf'] or x['suf'] == suf)] or f
+            if len(f) > 1:
+                f = [x for x in f if x['tier'] == tier] or f
+            cands = f
+        return cands[0]
+    sig = set(cs.split())
+    mejor, sc, emp = None, 0.0, 0
+    for _c, rec in por_edad.get(edad, []):
+        if suf and rec['suf'] and suf != rec['suf']:
+            continue
+        inter = len(sig & rec['sig'])
+        if not inter:
+            continue
+        j = inter / len(sig | rec['sig'])
+        if j > sc:
+            mejor, sc, emp = rec, j, 1
+        elif j == sc:
+            emp += 1
+    return mejor if (mejor and sc >= 0.6 and emp == 1) else None
+
+def _header_row_agenda(aws):
+    for r in range(1, 16):
+        vals = [str(aws.cell(r, c).value or '').strip().lower() for c in range(1, 14)]
+        if 'jornada' in vals and any('equipo' in v for v in vals):
+            return r
+    return 7
+
+def volcar_agendas(uploaded_seguimiento, agendas):
+    """Mete el ojeo de las agendas rellenadas en el seguimiento (como la macro).
+    Columnas de la agenda: A=técnico, E=jornada, F/G/H=equipo/valoración/comentario local,
+    I/J/K=visitante, L=categoría. Devuelve (BytesIO del .xlsm, stats)."""
+    import openpyxl
+    uploaded_seguimiento.seek(0)
+    wb = openpyxl.load_workbook(uploaded_seguimiento, keep_vba=True)
+    idx, por_edad = _indice_volcado(wb)
+    jcol = {}
+    volcados = 0
+    no_encontrados = []
+    for af in agendas:
+        try:
+            af.seek(0)
+        except Exception:
+            pass
+        awb = openpyxl.load_workbook(af, read_only=True, data_only=True)
+        aws = awb['Agenda'] if 'Agenda' in awb.sheetnames else awb[awb.sheetnames[0]]
+        hr = _header_row_agenda(aws)
+        for row in aws.iter_rows(min_row=hr + 1, values_only=True):
+            if row is None or len(row) < 12:
+                continue
+            tecnico, jornada, categoria = row[0], row[4], row[11]
+            if categoria is None or not str(categoria).strip():
+                continue
+            for (eqi, vali, comi) in [(5, 6, 7), (8, 9, 10)]:
+                eq = row[eqi] if len(row) > eqi else None
+                val = row[vali] if len(row) > vali else None
+                com = row[comi] if len(row) > comi else None
+                if val is None or not str(val).strip() or eq is None or not str(eq).strip():
+                    continue
+                rec = _fila_para(idx, por_edad, categoria, eq)
+                if rec is None:
+                    no_encontrados.append((str(categoria), str(eq)))
+                    continue
+                ws, r = rec['ws'], rec['row']
+                if id(ws) not in jcol:
+                    jcol[id(ws)] = _mapa_jornada_col(ws)
+                try:
+                    jn = int(float(jornada))
+                except (TypeError, ValueError):
+                    jn = None
+                if jn and jn in jcol[id(ws)]:
+                    ws.cell(r, jcol[id(ws)][jn]).value = val
+                for i in range(10):  # primer bloque de visualización libre (AK=37, paso 2)
+                    ccol = 37 + i * 2
+                    if ws.cell(r, ccol).value in (None, ''):
+                        ws.cell(r, ccol).value = tecnico
+                        ws.cell(r, ccol + 1).value = com
+                        break
+                volcados += 1
+    out = BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out, {'volcados': volcados, 'no_encontrados': no_encontrados}
+
+# =============================================================================
+# TABS
+# =============================================================================
+tab1, tab2, tab3 = st.tabs(["📋 Procesar Partidos Nuevos", "🔄 Actualizar Agenda Existente",
+                            "📥 Volcar ojeo al seguimiento"])
+
 with tab1:
     st.header("📋 Crear Agenda Desde Cero")
-    st.markdown("Combina la lista de partidos con el seguimiento de ligas para crear una agenda nueva")
+    st.markdown("Cruza la lista de partidos con el seguimiento (F7 **y** F11) consolidando nombres, "
+                "y añade la **provincia por código de club** (tabla maestra que se guarda y crece sola).")
 
-    # Crear dos columnas para los uploads
-    col1, col2 = st.columns(2)
-
+    col1, col2, col3 = st.columns(3)
     with col1:
         st.subheader("📄 Lista de Partidos (CSV)")
-        uploaded_csv = st.file_uploader(
-            "Sube el archivo ListaPartidos.csv", 
-            type=['csv'],
-            key="csv_file"
-        )
-
+        uploaded_csv = st.file_uploader("Sube el archivo ListaPartidos.csv", type=['csv'], key="csv_file")
     with col2:
         st.subheader("📊 Seguimiento Ligas (Excel)")
-        uploaded_excel = st.file_uploader(
-            "Sube el archivo Seguimiento_ligas.xlsm", 
-            type=['xlsx', 'xlsm'],
-            key="excel_file"
-        )
+        uploaded_excel = st.file_uploader("Sube el Seguimiento_ligas_26-27.xlsm", type=['xlsx', 'xlsm'], key="excel_file")
+    with col3:
+        st.subheader("🗂️ Tabla maestra provincias")
+        uploaded_maestro = st.file_uploader("maestro_provincias_clubes.csv (opcional)", type=['csv'], key="maestro_file",
+                                            help="Opcional. Si no la subes, se usa la guardada junto a la app. Se actualiza sola con los clubes nuevos.")
 
     if uploaded_csv is not None and uploaded_excel is not None:
         try:
             with st.spinner('Procesando archivos...'):
-                
-                # Leer el archivo CSV
-                # - dtype=str en Competición/Grupo: evita que pandas los infiera como int/float
-                #   y rompa la concatenación de más abajo.
-                # - index_col=False: el CSV trae un ';' de más al final de cada fila (18 campos
-                #   contra 17 cabeceras). Sin esto, pandas usa la 1ª columna como índice y
-                #   desplaza todos los datos una columna a la izquierda.
-                lect_partidos = pd.read_csv(
-                    uploaded_csv, encoding="latin1", on_bad_lines='skip', sep=';',
-                    dtype={'Competición': str, 'Grupo': str},
-                    index_col=False,
-                )
-                # Si el separador de más generó una columna sin nombre al final, descártala.
-                lect_partidos = lect_partidos.loc[:, ~lect_partidos.columns.astype(str).str.startswith('Unnamed')]
-                
-                # Crear DataFrame de partidos
-                df_partidos = lect_partidos.drop(columns=['Club Casa', 'Club Visitante', 'Equipo Casa', 'Equipo Visitante',
-                                                         'Resultado', 'Código Partido', 'Árbitro'], errors='ignore')
-                
-                # Extraer la provincia de la columna 'Competición'
-                df_partidos['Provincia'] = df_partidos['Competición'].str.extract(r'\((.*?)\)')
-                
-                # Concatenar 'Competición' y 'Grupo' en una nueva columna
-                df_partidos['Competicion'] = df_partidos['Competición'] + ", " + df_partidos['Grupo']
-                
-                # Eliminar las columnas originales 'Competición' y 'Grupo'
-                df_partidos = df_partidos.drop(columns=['Competición', 'Grupo'], errors='ignore')
-                
-                # Leer el archivo de Excel
-                lect_seguimiento = pd.read_excel(uploaded_excel)
-                
-                # Eliminar las primeras 5 filas
-                df_seguimiento = lect_seguimiento.drop(index=lect_seguimiento.index[:5])
-                
-                # Renombrar columnas relevantes (por posición; reasignar la lista entera para compatibilidad con pandas 2.x)
-                new_cols = df_seguimiento.columns.tolist()
-                if len(new_cols) <= 36:
-                    raise ValueError(
-                        f"El Excel de seguimiento tiene {len(new_cols)} columnas tras quitar las 5 primeras filas; "
-                        "se esperaban al menos 37 (Visualización C en col 37, Detalles Equipo Casa en col 36)."
-                    )
-                new_cols[0] = 'Competicion'
-                new_cols[2] = 'Nombre Club Casa'
-                new_cols[35] = 'Detalles Equipo Casa'
-                new_cols[36] = 'Visualización C'
-                df_seguimiento.columns = new_cols
-                
-                # Seleccionar columnas necesarias
-                df_seguimiento = df_seguimiento[['Competicion', 'Nombre Club Casa', 'Visualización C', 'Detalles Equipo Casa']]
-                
-                # Realizar la primera unión
-                resultado_casa = pd.merge(df_partidos, df_seguimiento, on=['Competicion', 'Nombre Club Casa'], how='left')
-                
-                # Preparar DataFrame para equipos visitantes
-                df_visitante = df_seguimiento.copy()
-                df_visitante.columns = ['Competicion', 'Nombre Club Visitante', 'Visualización V', 'Detalles Equipo Visitante']
-                
-                # Realizar la segunda unión
-                resultado = pd.merge(resultado_casa, df_visitante, on=['Competicion', 'Nombre Club Visitante'], how='left')
-                
-                # ¡AQUÍ ES DONDE SE CREAN LAS NUEVAS COLUMNAS!
-                # Agregar las columnas de técnico y motivo al inicio (vacías)
-                resultado['Técnico'] = ''  # Columna A - vacía para que puedas llenarla
-                resultado['Motivo'] = ''   # Columna B - vacía para que puedas llenarla
-                
-                # Agregar la columna "Visto" calculada (Columna C)
-                # Replica la fórmula de Excel: =SI(Y(J2<>""; M2<>""); "Rellenas"; "Incompletas")
-                # Donde J = "Visualización C" y M = "Visualización V"
-                def calcular_visto(row):
-                    vis_c = row.get('Visualización C', '')
-                    vis_v = row.get('Visualización V', '')
-                    
-                    # Convertir a string para manejar NaN y otros tipos
-                    vis_c_str = str(vis_c) if pd.notna(vis_c) else ''
-                    vis_v_str = str(vis_v) if pd.notna(vis_v) else ''
-                    
-                    # Aplicar la lógica exacta de Excel: Y(J2<>""; M2<>"")
-                    if vis_c_str != '' and vis_v_str != '':
-                        return 'Rellenas'
+                # 1) LISTA DE PARTIDOS
+                lect = pd.read_csv(uploaded_csv, encoding="latin1", on_bad_lines='skip', sep=';',
+                                   dtype={'Competición': str, 'Grupo': str, 'Club Casa': str, 'Club Visitante': str},
+                                   index_col=False)
+                lect = lect.loc[:, ~lect.columns.astype(str).str.startswith('Unnamed')]
+                df = lect.copy()
+                df['Competicion'] = (df['Competición'].fillna('') + ", " + df['Grupo'].fillna('')) \
+                    .str.strip().str.strip(',').str.strip()
+                df['Modalidad'] = df['Competición'].map(modalidad)
+
+                # 2) SEGUIMIENTO: PRIMERO se anaden los equipos nuevos de esta lista y LUEGO
+                #    se cruza, para que esos equipos nuevos ya aparezcan en la agenda.
+                seg_out, seg_stats = None, None
+                try:
+                    seg_out, seg_stats = actualizar_seguimiento(uploaded_excel, df)
+                except Exception as _e_seg:
+                    st.warning(f"No se pudo actualizar el seguimiento; se cruza con el original: {_e_seg}")
+                fuente_cruce = seg_out if seg_out is not None else uploaded_excel
+                try:
+                    fuente_cruce.seek(0)
+                except Exception:
+                    pass
+                registros = leer_seguimiento(fuente_cruce)
+                por_canon, por_edad = construir_indices(registros)
+                vis_c, det_c, match_c, vis_v, det_v = [], [], [], [], []
+                for _, row in df.iterrows():
+                    comp = row.get('Competición', '')
+                    compfull = row.get('Competicion', '')
+                    vc, dc = resolver_equipo(por_canon, por_edad, comp, row.get('Equipo Casa', ''), compfull)
+                    vv, dv = resolver_equipo(por_canon, por_edad, comp, row.get('Equipo Visitante', ''), compfull)
+                    vis_c.append(vc); det_c.append(dc); match_c.append(vc is not None or dc is not None)
+                    vis_v.append(vv); det_v.append(dv)
+                df['Visualización C'] = vis_c
+                df['Detalles Equipo Casa'] = det_c
+                df['Visualización V'] = vis_v
+                df['Detalles Equipo Visitante'] = det_v
+                df['_match_casa'] = match_c
+
+                # 3) PROVINCIA por código de club + tabla maestra (se guarda y crece sola)
+                prov_map, nom_map = cargar_maestro(uploaded_maestro)
+
+                dir_col = 'Dirección Campo' if 'Dirección Campo' in df.columns else None
+                df['_prov_dir'] = df[dir_col].map(provincia_de_direccion) if dir_col else None
+                df['_prov_comp'] = df['Competición'].map(provincia_de_competicion)
+
+                def _guardar_club(code, nombre, prov):
+                    code = str(code) if pd.notna(code) else ''
+                    if code and prov and code not in prov_map:
+                        prov_map[code] = prov
+                        nom_map[code] = str(nombre) if pd.notna(nombre) else ''
+                        return True
+                    return False
+
+                nuevos = 0
+                # club de CASA: provincia por dirección del campo (mejor) o, si no, por competición
+                for code, grp in df.groupby('Club Casa'):
+                    pv = grp['_prov_dir'].dropna()
+                    if len(pv):
+                        prov = pv.mode().iat[0]
                     else:
-                        return 'Incompletas'
-                
-                resultado['Visto'] = resultado.apply(calcular_visto, axis=1)
-                
-                # Establecer orden en las columnas del dataframe (AHORA con las nuevas columnas primero)
-                nuevo_orden = ['Técnico', 'Motivo', 'Visto', 'Fecha', 'Hora', 'Jornada', 'Competicion', 'Provincia', 'Nombre Club Casa',
-                              'Visualización C', 'Detalles Equipo Casa', 'Nombre Club Visitante',
-                              'Visualización V', 'Detalles Equipo Visitante', 'Campo', 'Dirección Campo']
-                
-                df_resultado = resultado[nuevo_orden]
-                
-                # Convertir la columna 'Fecha' a formato datetime
-                df_resultado['Fecha'] = pd.to_datetime(df_resultado['Fecha'], errors='coerce', dayfirst=True)
-                
-                # Aplicar el formato de fecha deseado
-                df_resultado['Fecha'] = df_resultado['Fecha'].dt.strftime('%d/%m/%Y')
-            
-            # Mostrar preview de los resultados
+                        pc = grp['_prov_comp'].dropna()
+                        prov = pc.mode().iat[0] if len(pc) else None
+                    nom = grp['Nombre Club Casa'].dropna()
+                    if _guardar_club(code, nom.iloc[0] if len(nom) else '', prov):
+                        nuevos += 1
+                # club VISITANTE: solo si la competición indica provincia (ligas provinciales)
+                for code, grp in df.groupby('Club Visitante'):
+                    pc = grp['_prov_comp'].dropna()
+                    if len(pc):
+                        nom = grp['Nombre Club Visitante'].dropna()
+                        if _guardar_club(code, nom.iloc[0] if len(nom) else '', pc.mode().iat[0]):
+                            nuevos += 1
+
+                # Respaldo por NOMBRE de club: algunas filas vienen SIN codigo de club
+                # (p.ej. Division de Honor Juvenil), asi que no sirve la busqueda por codigo.
+                prov_por_nombre = {}
+                for _cod, _nb in nom_map.items():
+                    _cs, _ = canon_equipo(_nb)
+                    if _cs and _cod in prov_map:
+                        prov_por_nombre.setdefault(_cs, prov_map[_cod])
+                _por_nombre = df['Nombre Club Casa'].map(
+                    lambda x: prov_por_nombre.get(canon_equipo(x)[0]) if pd.notna(x) else None)                     if 'Nombre Club Casa' in df.columns else None
+
+                # provincia del PARTIDO: maestra por codigo > direccion > maestra por nombre > competicion
+                df['Provincia'] = (df['Club Casa'].astype(str).map(prov_map)
+                                   .fillna(df['_prov_dir']))
+                if _por_nombre is not None:
+                    df['Provincia'] = df['Provincia'].fillna(_por_nombre)
+                df['Provincia'] = df['Provincia'].fillna(df['_prov_comp'])
+
+                # guardar la maestra actualizada
+                df_maestro = maestro_a_df(prov_map, nom_map)
+                guardado = guardar_maestro(df_maestro)
+
+                # 4) COLUMNAS Y ORDEN
+                df['Técnico'] = ''
+                df['Motivo'] = ''
+
+                df['Visto'] = df.apply(
+                    lambda r: estado_visto(r.get('Visualización C'), r.get('Visualización V')), axis=1)
+
+                orden = ['Técnico', 'Motivo', 'Visto', 'Modalidad', 'Fecha', 'Hora', 'Jornada', 'Competicion', 'Provincia',
+                         'Nombre Club Casa', 'Equipo Casa', 'Visualización C', 'Detalles Equipo Casa',
+                         'Nombre Club Visitante', 'Equipo Visitante', 'Visualización V', 'Detalles Equipo Visitante',
+                         'Campo', 'Dirección Campo']
+                orden = [c for c in orden if c in df.columns]
+                df_resultado = df[orden].copy()
+                df_resultado['Fecha'] = pd.to_datetime(df_resultado['Fecha'], errors='coerce', dayfirst=True).dt.strftime('%d/%m/%Y')
+
             st.success("✅ Archivos procesados correctamente!")
+
+            total = len(df)
+            loc = int(df['_match_casa'].sum())
+            con_prov = int(df['Provincia'].notna().sum() if 'Provincia' in df else 0)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("📊 Partidos", total)
+            c2.metric("🎯 Equipo casa localizado", f"{loc} ({100*loc//max(1,total)}%)")
+            c3.metric("🗺️ Con provincia", f"{con_prov} ({100*con_prov//max(1,total)}%)")
+
+            vc_mod = df['Modalidad'].value_counts()
+            st.write("**Reparto por modalidad:** "
+                     + " · ".join(f"{k}: {int(v)}" for k, v in vc_mod.items()))
+
+            msg = f"🗂️ Tabla maestra: {len(df_maestro)} clubes ({nuevos} nuevos añadidos esta vez)."
+            msg += " Guardada junto a la app." if guardado else " ⚠️ No se pudo guardar localmente; descárgala abajo."
+            st.info(msg)
+            st.caption("Los partidos de categorías que el seguimiento no rastrea (sénior amateur, fútbol sala, "
+                       "femenino, copas) saldrán sin localizar en el seguimiento; es lo esperado.")
+
             st.subheader("👀 Vista previa del resultado")
-            st.dataframe(df_resultado.head(10))
-            
-            st.info(f"📊 Total de registros procesados: {len(df_resultado)}")
-            
-            # Crear el archivo Excel en memoria
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            st.dataframe(df_resultado.head(15))
+
+            out = BytesIO()
+            with pd.ExcelWriter(out, engine=EXCEL_ENGINE) as writer:
                 df_resultado.to_excel(writer, sheet_name='Resultado', index=False)
-            
-            # Botón de descarga
-            st.download_button(
-                label="📥 Descargar agenda_nueva.xlsx",
-                data=output.getvalue(),
-                file_name="agenda_nueva.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-            
+            cda, cdb = st.columns(2)
+            cda.download_button("📥 Descargar agenda_nueva.xlsx", data=out.getvalue(),
+                                file_name="agenda_nueva.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            cdb.download_button("💾 Descargar tabla maestra actualizada",
+                                data=df_maestro.to_csv(sep=';', index=False, encoding='utf-8-sig').encode('utf-8-sig'),
+                                file_name="maestro_provincias_clubes.csv", mime="text/csv")
+
+            # --- Seguimiento actualizado (los equipos nuevos YA se anadieron antes del cruce) ---
+            st.markdown("---")
+            st.subheader("🔄 Seguimiento actualizado")
+            if seg_out is None:
+                st.warning("El Excel subido no tiene las hojas 'andalucia f7' / 'andalucia f-11', "
+                           "o no se pudo actualizar.")
+            else:
+                st.success(f"Añadidos **{seg_stats['F7']}** equipos nuevos a F7 y **{seg_stats['F11']}** a F11. "
+                           "Ya estaban incluidos al cruzar la agenda, y tu ojeo se conserva.")
+                st.download_button("📥 Descargar Seguimiento actualizado (.xlsm)", data=seg_out.getvalue(),
+                                   file_name="Seguimiento_ligas_actualizado.xlsm",
+                                   mime="application/vnd.ms-excel.sheet.macroEnabled.12")
+
         except Exception as e:
             st.error(f"❌ Error al procesar los archivos: {str(e)}")
-            st.info("Verifica que los archivos tengan el formato correcto y las columnas esperadas.")
-
+            st.exception(e)
     else:
-        st.info("👆 Sube ambos archivos para comenzar el procesamiento")
+        st.info("👆 Sube la lista de partidos y el seguimiento para comenzar")
 
 
 # =============================================================================
-# TAB 2: ACTUALIZACIÓN DE AGENDA EXISTENTE
+# TAB 2: ACTUALIZACIÓN DE AGENDA EXISTENTE  (sin cambios de lógica)
 # =============================================================================
 with tab2:
     st.header("🔄 Actualizar Agenda Existente")
     st.markdown("Actualiza una agenda preservando tu trabajo ya hecho (técnicos, motivos, etc.)")
-    
-    # Crear dos columnas para los uploads de actualización
+
     col1, col2 = st.columns(2)
-    
     with col1:
         st.subheader("📅 Agenda Actual (con tu trabajo)")
-        archivo_base = st.file_uploader(
-            "Sube tu agenda actual (la que tiene técnicos asignados, motivos, etc.)", 
-            type=['xlsx', 'xlsm'],
-            key="archivo_base",
-            help="Este archivo contiene tu trabajo que NO quieres perder"
-        )
-    
+        archivo_base = st.file_uploader("Sube tu agenda actual (con técnicos, motivos, etc.)",
+                                        type=['xlsx', 'xlsm'], key="archivo_base",
+                                        help="Este archivo contiene tu trabajo que NO quieres perder")
     with col2:
         st.subheader("🆕 Agenda Nueva (datos actualizados)")
-        archivo_nuevo = st.file_uploader(
-            "Sube la agenda nueva (con datos actualizados de fechas, horarios, etc.)", 
-            type=['xlsx', 'xlsm'],
-            key="archivo_nuevo",
-            help="Este archivo tiene los datos nuevos que quieres actualizar"
-        )
-    
-    # Configuración de actualización
+        archivo_nuevo = st.file_uploader("Sube la agenda nueva (fechas, horarios, etc.)",
+                                         type=['xlsx', 'xlsm'], key="archivo_nuevo",
+                                         help="Este archivo tiene los datos nuevos que quieres actualizar")
+
     if archivo_base is not None and archivo_nuevo is not None:
         st.subheader("⚙️ Configuración de Actualización")
-        
-        # Leer archivos para mostrar columnas disponibles
         try:
             df_base_preview = pd.read_excel(archivo_base)
             df_nuevo_preview = pd.read_excel(archivo_nuevo)
-            
             col1, col2 = st.columns(2)
-            
             with col1:
-                st.write("**Columnas disponibles en archivo base:**")
-                st.write(list(df_base_preview.columns))
-            
+                st.write("**Columnas en archivo base:**"); st.write(list(df_base_preview.columns))
             with col2:
-                st.write("**Columnas disponibles en archivo nuevo:**")
-                st.write(list(df_nuevo_preview.columns))
-            
-            # Selección de columnas a actualizar
+                st.write("**Columnas en archivo nuevo:**"); st.write(list(df_nuevo_preview.columns))
+
             st.subheader("📋 Selecciona qué columnas quieres actualizar")
             columnas_comunes = list(set(df_base_preview.columns) & set(df_nuevo_preview.columns))
-            
-            # Excluir columnas importantes que NO deben actualizarse
             columnas_protegidas = ['Técnico', 'Motivo', 'Visto']
-            columnas_disponibles = [col for col in columnas_comunes if col not in columnas_protegidas]
-            
-            # Preseleccionar columnas típicas
-            columnas_por_defecto = []
-            for col in ['Fecha', 'Hora', 'Campo', 'Dirección Campo']:
-                if col in columnas_disponibles:
-                    columnas_por_defecto.append(col)
-            
-            columnas_seleccionadas = st.multiselect(
-                "Columnas a actualizar:",
-                columnas_disponibles,
-                default=columnas_por_defecto,
-                help="Solo se actualizarán estas columnas. Tu trabajo (Técnico, Motivo, Visto) se preservará automáticamente."
-            )
-            
-            # Mostrar advertencia sobre columnas protegidas
-            if columnas_protegidas:
-                st.info(f"🛡️ **Columnas protegidas** (NO se actualizarán): {', '.join(columnas_protegidas)}")
-            
-            
-            # Selección de columna ID
+            columnas_disponibles = [c for c in columnas_comunes if c not in columnas_protegidas]
+            columnas_por_defecto = [c for c in ['Fecha', 'Hora', 'Campo', 'Dirección Campo'] if c in columnas_disponibles]
+            columnas_seleccionadas = st.multiselect("Columnas a actualizar:", columnas_disponibles,
+                                                     default=columnas_por_defecto,
+                                                     help="Solo se actualizarán estas. Técnico/Motivo/Visto se preservan.")
+            st.info(f"🛡️ **Columnas protegidas** (NO se actualizan): {', '.join(columnas_protegidas)}")
+
             st.subheader("🆔 Columna para identificar partidos")
-            columna_id = st.selectbox(
-                "Selecciona la columna que identifica únicamente cada partido:",
-                ["Usar posición de fila"] + columnas_comunes,
-                help="Esta columna se usa para saber qué partido corresponde a cuál entre los dos archivos"
-            )
-            
+            columna_id = st.selectbox("Columna que identifica cada partido:", ["Usar posición de fila"] + columnas_comunes)
             if columna_id == "Usar posición de fila":
                 columna_id = None
-            
-            # Botón para procesar
+
             if st.button("🚀 Actualizar Agenda", type="primary"):
                 if not columnas_seleccionadas:
                     st.error("❌ Debes seleccionar al menos una columna para actualizar")
                 else:
                     try:
                         with st.spinner('🔄 Actualizando agenda...'):
-                            
-                            # Función de actualización integrada
                             def actualizar_agenda(df_martes, df_miercoles, columnas_a_actualizar, columna_id):
-                                # Crear copia del archivo del martes como base
                                 df_resultado = df_martes.copy()
-                                
-                                # Si no hay columna ID, crear una basada en la posición
                                 if not columna_id:
                                     columna_id = '_posicion_fila'
                                     df_martes[columna_id] = df_martes.index
                                     df_miercoles[columna_id] = df_miercoles.index
                                     df_resultado[columna_id] = df_resultado.index
-                                
-                                # Estadísticas
                                 partidos_actualizados = 0
                                 partidos_sin_match = 0
-                                columnas_actualizadas = {col: 0 for col in columnas_a_actualizar}
-                                
-                                # Crear diccionario del archivo del martes para búsqueda rápida
-                                dict_martes = {}
-                                for idx, row in df_resultado.iterrows():
-                                    key = str(row[columna_id])
-                                    dict_martes[key] = idx
-                                
-                                # Actualizar cada partido del miércoles
-                                for _, row_miercoles in df_miercoles.iterrows():
-                                    key = str(row_miercoles[columna_id])
-                                    
+                                columnas_actualizadas = {c: 0 for c in columnas_a_actualizar}
+                                dict_martes = {str(row[columna_id]): idx for idx, row in df_resultado.iterrows()}
+                                for _, row_m in df_miercoles.iterrows():
+                                    key = str(row_m[columna_id])
                                     if key in dict_martes:
-                                        idx_martes = dict_martes[key]
-                                        partido_actualizado = False
-                                        
-                                        # Actualizar solo las columnas especificadas
+                                        idx_m = dict_martes[key]
+                                        cambiado = False
                                         for columna in columnas_a_actualizar:
                                             if columna in df_miercoles.columns:
-                                                valor_nuevo = row_miercoles[columna]
-                                                valor_anterior = df_resultado.loc[idx_martes, columna]
-                                                
-                                                # Solo actualizar si hay cambio
-                                                if pd.isna(valor_anterior) and pd.isna(valor_nuevo):
+                                                vn = row_m[columna]; va = df_resultado.loc[idx_m, columna]
+                                                if pd.isna(va) and pd.isna(vn):
                                                     continue
-                                                elif valor_anterior != valor_nuevo:
-                                                    df_resultado.loc[idx_martes, columna] = valor_nuevo
+                                                elif va != vn:
+                                                    df_resultado.loc[idx_m, columna] = vn
                                                     columnas_actualizadas[columna] += 1
-                                                    partido_actualizado = True
-                                        
-                                        if partido_actualizado:
+                                                    cambiado = True
+                                        if cambiado:
                                             partidos_actualizados += 1
-                                            df_resultado.loc[idx_martes, 'Ultima_Actualizacion'] = datetime.now().strftime("%Y-%m-%d %H:%M")
-                                            
-                                            # Recalcular el campo "Visto" usando la fórmula de Excel exacta
+                                            df_resultado.loc[idx_m, 'Ultima_Actualizacion'] = datetime.now().strftime("%Y-%m-%d %H:%M")
                                             if 'Visto' in df_resultado.columns:
-                                                vis_c = df_resultado.loc[idx_martes, 'Visualización C'] if 'Visualización C' in df_resultado.columns else ''
-                                                vis_v = df_resultado.loc[idx_martes, 'Visualización V'] if 'Visualización V' in df_resultado.columns else ''
-                                                
-                                                # Convertir a string para manejar NaN
-                                                vis_c_str = str(vis_c) if pd.notna(vis_c) else ''
-                                                vis_v_str = str(vis_v) if pd.notna(vis_v) else ''
-                                                
-                                                # Aplicar fórmula Excel: =SI(Y(J2<>""; M2<>""); "Rellenas"; "Incompletas")
-                                                if vis_c_str != '' and vis_v_str != '':
-                                                    df_resultado.loc[idx_martes, 'Visto'] = 'Rellenas'
-                                                else:
-                                                    df_resultado.loc[idx_martes, 'Visto'] = 'Incompletas'
+                                                vc = df_resultado.loc[idx_m, 'Visualización C'] if 'Visualización C' in df_resultado.columns else ''
+                                                vv = df_resultado.loc[idx_m, 'Visualización V'] if 'Visualización V' in df_resultado.columns else ''
+                                                df_resultado.loc[idx_m, 'Visto'] = estado_visto(vc, vv)
                                     else:
                                         partidos_sin_match += 1
-                                
-                                # Limpiar columna temporal si la creamos
                                 if columna_id == '_posicion_fila':
                                     df_resultado = df_resultado.drop(columna_id, axis=1)
-                                
-                                return df_resultado, {
-                                    'partidos_actualizados': partidos_actualizados,
-                                    'partidos_sin_match': partidos_sin_match,
-                                    'columnas_actualizadas': columnas_actualizadas
-                                }
-                            
-                            # Cargar archivos
+                                return df_resultado, {'partidos_actualizados': partidos_actualizados,
+                                                      'partidos_sin_match': partidos_sin_match,
+                                                      'columnas_actualizadas': columnas_actualizadas}
+
                             df_base = pd.read_excel(archivo_base)
                             df_nuevo = pd.read_excel(archivo_nuevo)
-                            
-                            # Ejecutar actualización
-                            df_actualizado, stats = actualizar_agenda(
-                                df_base, df_nuevo, columnas_seleccionadas, columna_id
-                            )
-                        
-                        # Mostrar resultados
+                            df_actualizado, stats = actualizar_agenda(df_base, df_nuevo, columnas_seleccionadas, columna_id)
+
                         st.success("✅ Agenda actualizada correctamente!")
-                        
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            st.metric("🎯 Partidos actualizados", stats['partidos_actualizados'])
-                        with col2:
-                            st.metric("❓ Sin correspondencia", stats['partidos_sin_match'])
-                        with col3:
-                            st.metric("📊 Total partidos", len(df_actualizado))
-                        
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("🎯 Partidos actualizados", stats['partidos_actualizados'])
+                        c2.metric("❓ Sin correspondencia", stats['partidos_sin_match'])
+                        c3.metric("📊 Total partidos", len(df_actualizado))
                         st.subheader("📈 Cambios por columna")
                         for columna, cambios in stats['columnas_actualizadas'].items():
                             st.write(f"**{columna}**: {cambios} cambios")
-                        
-                        # Vista previa
                         st.subheader("👀 Vista previa del resultado")
                         st.dataframe(df_actualizado.head(10))
-                        
-                        # Crear archivo para descarga
-                        output_actualizado = BytesIO()
-                        with pd.ExcelWriter(output_actualizado, engine='xlsxwriter') as writer:
+                        output_act = BytesIO()
+                        with pd.ExcelWriter(output_act, engine=EXCEL_ENGINE) as writer:
                             df_actualizado.to_excel(writer, sheet_name='Agenda_Actualizada', index=False)
-                        
-                        # Botón de descarga
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M')
-                        st.download_button(
-                            label="📥 Descargar agenda_actualizada.xlsx",
-                            data=output_actualizado.getvalue(),
-                            file_name=f"agenda_actualizada_{timestamp}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
-                        
+                        ts = datetime.now().strftime('%Y%m%d_%H%M')
+                        st.download_button("📥 Descargar agenda_actualizada.xlsx", data=output_act.getvalue(),
+                                           file_name=f"agenda_actualizada_{ts}.xlsx",
+                                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                     except Exception as e:
                         st.error(f"❌ Error al actualizar la agenda: {str(e)}")
-                        st.info("Verifica que ambos archivos tengan el formato correcto.")
-        
         except Exception as e:
             st.error(f"❌ Error al leer los archivos: {str(e)}")
-    
     else:
         st.info("👆 Sube ambos archivos para configurar la actualización")
 
-# Información adicional en la sidebar
+# =============================================================================
+# TAB 3: VOLCAR OJEO DE LAS AGENDAS AL SEGUIMIENTO (reemplaza la macro)
+# =============================================================================
+with tab3:
+    st.header("📥 Volcar ojeo al seguimiento")
+    st.markdown("Mete en el seguimiento las **valoraciones y jugadores destacados** de las agendas que "
+                "han rellenado los técnicos. Reemplaza la macro y cruza los nombres de forma inteligente "
+                "(por edad + nombre consolidado), en las dos hojas.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("📊 Seguimiento")
+        seg_v = st.file_uploader("Sube el seguimiento (.xlsm)", type=['xlsx', 'xlsm'], key="seg_volcado")
+    with c2:
+        st.subheader("📝 Agendas rellenadas")
+        agendas_v = st.file_uploader("Sube una o varias agendas (hoja 'Agenda' con técnico/valoración/equipo)",
+                                     type=['xlsx', 'xlsm'], accept_multiple_files=True, key="agendas_volcado")
+
+    if seg_v is not None and agendas_v:
+        if st.button("📥 Volcar al seguimiento", type="primary"):
+            try:
+                with st.spinner('Volcando el ojeo al seguimiento...'):
+                    seg_out, seg_stats = volcar_agendas(seg_v, agendas_v)
+                nenc = seg_stats['no_encontrados']
+                st.success(f"✅ Volcadas **{seg_stats['volcados']}** valoraciones al seguimiento.")
+                if nenc:
+                    st.warning(f"⚠️ {len(nenc)} equipos de las agendas no se encontraron en el seguimiento "
+                               "(nombre/categoría que no casa, o equipo aún no dado de alta).")
+                    with st.expander(f"Ver {len(nenc)} no encontrados"):
+                        st.dataframe(pd.DataFrame(nenc, columns=['Categoría', 'Equipo']).drop_duplicates()
+                                     .reset_index(drop=True))
+                st.download_button("📥 Descargar seguimiento con el ojeo (.xlsm)", data=seg_out.getvalue(),
+                                   file_name="Seguimiento_ligas_actualizado.xlsm",
+                                   mime="application/vnd.ms-excel.sheet.macroEnabled.12")
+            except Exception as e:
+                st.error(f"❌ Error al volcar: {str(e)}")
+                st.exception(e)
+    else:
+        st.info("👆 Sube el seguimiento y al menos una agenda rellenada por los técnicos.")
+
+# =============================================================================
+# SIDEBAR
+# =============================================================================
 with st.sidebar:
     st.header("ℹ️ Guía de Uso")
-    
     st.subheader("📋 Procesar Partidos Nuevos")
     st.markdown("""
-    - Sube tu CSV de partidos
-    - Sube tu Excel de seguimiento  
-    - Se crean automáticamente las columnas:
-      - **Técnico** (vacía para que asignes)
-      - **Motivo** (vacía para comentarios)
-      - **Visto** (calculada según Visualización C y V):
-        - 🟢 "Rellenas" si ambas visualizaciones tienen datos
-        - 🔴 "Incompletas" si falta alguna visualización
-    - Descarga la agenda completa
+    - Sube el **CSV de partidos** y el **Seguimiento** (hojas *andalucia f7* y *andalucia f-11*)
+    - Los equipos se cruzan **consolidando nombres** (ignora comillas, C.D./C.F./SAD, sufijos A/B/C…)
+    - La **provincia** se deduce del partido (dirección/competición) y se guarda por **código de club** en una **tabla maestra** que crece sola
+    - Se crean: **Técnico**, **Motivo** (vacías) y **Visto**: 🟢 Rellenas (los dos ojeados) · 🟡 Solo casa · 🟡 Solo visitante · 🔴 Incompletas
     """)
-    
     st.subheader("🔄 Actualizar Agenda")
-    st.markdown("""
-    - Sube tu agenda actual (con trabajo hecho)
-    - Sube la agenda nueva (datos actualizados)
-    - Selecciona qué columnas actualizar
-    - **Técnico, Motivo y Visto se preservan**
-    """)
-    
-    st.subheader("🛡️ Campo Calculado")
-    st.success("✅ Técnico: Tu trabajo nunca se pierde")
-    st.success("✅ Motivo: Tus comentarios se mantienen")  
-    st.info("🧮 Visto: Replica fórmula Excel exacta:")
-    st.code("=SI(Y(J2<>\"\"; M2<>\"\"); \"Rellenas\"; \"Incompletas\")")
-    st.markdown("""
-    - 🟢 **"Rellenas"** = Visualización C **Y** Visualización V no están vacías
-    - 🔴 **"Incompletas"** = Cualquiera de las dos está vacía
-    """)
-    st.success("✅ Solo se actualizan fechas, horarios, campos, etc.")
+    st.markdown("- Sube agenda actual + agenda nueva. **Técnico/Motivo/Visto se preservan.**")
+    st.info("🧮 Visto: Rellenas (los 2 ojeados) · Solo casa · Solo visitante · Incompletas (ninguno)")
