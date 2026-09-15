@@ -481,8 +481,19 @@ with tab1:
                     .str.strip().str.strip(',').str.strip()
                 df['Modalidad'] = df['Competición'].map(modalidad)
 
-                # 2) SEGUIMIENTO (F7 + F11) + cruce consolidado por nombre
-                registros = leer_seguimiento(uploaded_excel)
+                # 2) SEGUIMIENTO: PRIMERO se anaden los equipos nuevos de esta lista y LUEGO
+                #    se cruza, para que esos equipos nuevos ya aparezcan en la agenda.
+                seg_out, seg_stats = None, None
+                try:
+                    seg_out, seg_stats = actualizar_seguimiento(uploaded_excel, df)
+                except Exception as _e_seg:
+                    st.warning(f"No se pudo actualizar el seguimiento; se cruza con el original: {_e_seg}")
+                fuente_cruce = seg_out if seg_out is not None else uploaded_excel
+                try:
+                    fuente_cruce.seek(0)
+                except Exception:
+                    pass
+                registros = leer_seguimiento(fuente_cruce)
                 por_canon, por_edad = construir_indices(registros)
                 vis_c, det_c, match_c, vis_v, det_v = [], [], [], [], []
                 for _, row in df.iterrows():
@@ -594,22 +605,18 @@ with tab1:
                                 data=df_maestro.to_csv(sep=';', index=False, encoding='utf-8-sig').encode('utf-8-sig'),
                                 file_name="maestro_provincias_clubes.csv", mime="text/csv")
 
-            # --- Seguimiento actualizado (añade equipos nuevos de esta lista) ---
+            # --- Seguimiento actualizado (los equipos nuevos YA se anadieron antes del cruce) ---
             st.markdown("---")
             st.subheader("🔄 Seguimiento actualizado")
-            try:
-                with st.spinner('Añadiendo equipos nuevos al seguimiento...'):
-                    seg_out, seg_stats = actualizar_seguimiento(uploaded_excel, df)
-                if seg_out is None:
-                    st.warning("El Excel subido no tiene las hojas 'andalucia f7' / 'andalucia f-11'.")
-                else:
-                    st.success(f"Añadidos **{seg_stats['F7']}** equipos nuevos a F7 y **{seg_stats['F11']}** a F11 "
-                               "(los que no estaban, de las competiciones que interesan). El resto y tu ojeo se conservan.")
-                    st.download_button("📥 Descargar Seguimiento actualizado (.xlsm)", data=seg_out.getvalue(),
-                                       file_name="Seguimiento_ligas_actualizado.xlsm",
-                                       mime="application/vnd.ms-excel.sheet.macroEnabled.12")
-            except Exception as e:
-                st.warning(f"No se pudo actualizar el seguimiento: {e}")
+            if seg_out is None:
+                st.warning("El Excel subido no tiene las hojas 'andalucia f7' / 'andalucia f-11', "
+                           "o no se pudo actualizar.")
+            else:
+                st.success(f"Añadidos **{seg_stats['F7']}** equipos nuevos a F7 y **{seg_stats['F11']}** a F11. "
+                           "Ya estaban incluidos al cruzar la agenda, y tu ojeo se conserva.")
+                st.download_button("📥 Descargar Seguimiento actualizado (.xlsm)", data=seg_out.getvalue(),
+                                   file_name="Seguimiento_ligas_actualizado.xlsm",
+                                   mime="application/vnd.ms-excel.sheet.macroEnabled.12")
 
         except Exception as e:
             st.error(f"❌ Error al procesar los archivos: {str(e)}")
