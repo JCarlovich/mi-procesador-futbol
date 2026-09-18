@@ -490,8 +490,10 @@ def volcar_agendas(uploaded_seguimiento, agendas):
 # =============================================================================
 # TABS
 # =============================================================================
-tab1, tab2, tab3 = st.tabs(["📋 Procesar Partidos Nuevos", "🔄 Actualizar Agenda Existente",
-                            "📥 Volcar ojeo al seguimiento"])
+# El orden de la lista es el orden en que se ven. Paso 1 -> Paso 2 -> utilidad.
+tab1, tab3, tab2 = st.tabs(["1️⃣  Partidos → Agenda nueva",
+                            "2️⃣  Agenda rellenada → Seguimiento",
+                            "🔧 Actualizar agenda existente"])
 
 with tab1:
     st.header("📋 Crear Agenda Desde Cero")
@@ -530,6 +532,7 @@ with tab1:
                     seg_out, seg_stats = actualizar_seguimiento(uploaded_excel, df)
                 except Exception as _e_seg:
                     st.warning(f"No se pudo actualizar el seguimiento; se cruza con el original: {_e_seg}")
+
                 fuente_cruce = seg_out if seg_out is not None else uploaded_excel
                 try:
                     fuente_cruce.seek(0)
