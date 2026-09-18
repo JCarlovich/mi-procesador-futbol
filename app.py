@@ -117,6 +117,38 @@ def estado_visto(vis_casa, vis_visitante):
     return 'Incompletas'
 
 
+
+# --- Colores de las valoraciones -------------------------------------------------
+# El seguimiento trae 3 de los 4 colores en una extension "x14" que openpyxl NO sabe
+# escribir, asi que al guardar se perdian (el azul de "Volver a ver", etc.). Se
+# reescriben como formato condicional ESTANDAR, con los mismos colores de tema, para
+# que sobrevivan a esta y a todas las vueltas siguientes.
+RANGO_CF_VALORACIONES = 'D8:AI5258'
+CF_VALORACIONES = [('$C$2', 4, 0.5999633777886289),   # Volver a ver            (azul)
+                   ('$C$3', 5, 0.3999450666829432),   # Equipo de primer ano
+                   ('$C$4', 9, 0.5999633777886289)]   # Equipo con algun jugador 1er ano
+
+def asegurar_colores_valoraciones(ws):
+    """Garantiza que existan las reglas de color de las valoraciones en la hoja."""
+    from openpyxl.formatting.rule import FormulaRule
+    from openpyxl.styles import PatternFill
+    from openpyxl.styles.colors import Color
+    existentes = set()
+    try:
+        for _rango, reglas in ws.conditional_formatting._cf_rules.items():
+            for r in reglas:
+                for f in (getattr(r, 'formula', None) or []):
+                    existentes.add(str(f).replace(' ', ''))
+    except Exception:
+        pass
+    for ref, tema, tint in CF_VALORACIONES:
+        formula = 'NOT(ISERROR(SEARCH(%s,D8)))' % ref
+        if formula.replace(' ', '') in existentes:
+            continue
+        relleno = PatternFill(bgColor=Color(theme=tema, tint=tint))
+        ws.conditional_formatting.add(RANGO_CF_VALORACIONES,
+                                      FormulaRule(formula=[formula], fill=relleno, stopIfTrue=False))
+
 # =============================================================================
 # SEGUIMIENTO (hojas F7 y F11) -> índices para el cruce por nombre
 # =============================================================================
@@ -349,6 +381,7 @@ def actualizar_seguimiento(uploaded_excel, df):
             d = data[key]
             for j, col in enumerate(range(4, 58)):
                 ws.cell(rr, col).value = d[j]
+        asegurar_colores_valoraciones(ws)
 
     out = BytesIO()
     wb.save(out)
@@ -482,6 +515,9 @@ def volcar_agendas(uploaded_seguimiento, agendas):
                         ws.cell(r, ccol + 1).value = com
                         break
                 volcados += 1
+    for _h in wb.sheetnames:
+        if _h.lower() in HOJAS_SEGUIMIENTO:
+            asegurar_colores_valoraciones(wb[_h])
     out = BytesIO()
     wb.save(out)
     out.seek(0)
