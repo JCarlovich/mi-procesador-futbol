@@ -339,7 +339,9 @@ def actualizar_seguimiento(uploaded_excel, df):
         mod, _ = clasificar_comp(colA)
         if not mod:
             continue
-        for eqcol in ['Equipo Casa', 'Equipo Visitante']:
+        # Se usa SIEMPRE el nombre de club (no "Equipo Casa/Visitante"): es el que
+        # aparece en las agendas, asi todo el ciclo habla el mismo idioma.
+        for eqcol in ['Nombre Club Casa', 'Nombre Club Visitante']:
             eq = r.get(eqcol)
             if pd.notna(eq) and str(eq).strip():
                 nuevos[mod].add((colA, str(eq).strip()))
@@ -359,9 +361,15 @@ def actualizar_seguimiento(uploaded_excel, df):
                 key = (str(a).strip() if a is not None else '', str(c).strip())
                 data[key] = [ws.cell(rr, col).value for col in range(4, 58)]
         antes = len(data)
+        # Se compara por nombre CANONICO (no literal) para no duplicar el mismo equipo
+        # escrito de otra forma: "ATCO. SANLUQUENO C.F." vs "ATCO. SANLUQUENO C.F. S.A.D.",
+        # o el mismo club con/sin el sufijo de filial.
+        canon_exist = {(_norm_comp(a), canon_equipo(c)[0]) for (a, c) in data.keys()}
         for key in nuevos[mod]:
-            if key not in data:
+            kc = (_norm_comp(key[0]), canon_equipo(key[1])[0])
+            if key not in data and kc not in canon_exist:
                 data[key] = [None] * 54
+                canon_exist.add(kc)
         stats[mod] = len(data) - antes
 
         def clave(k):
@@ -580,8 +588,8 @@ with tab1:
                 for _, row in df.iterrows():
                     comp = row.get('Competición', '')
                     compfull = row.get('Competicion', '')
-                    vc, dc = resolver_equipo(por_canon, por_edad, comp, row.get('Equipo Casa', ''), compfull)
-                    vv, dv = resolver_equipo(por_canon, por_edad, comp, row.get('Equipo Visitante', ''), compfull)
+                    vc, dc = resolver_equipo(por_canon, por_edad, comp, row.get('Nombre Club Casa', ''), compfull)
+                    vv, dv = resolver_equipo(por_canon, por_edad, comp, row.get('Nombre Club Visitante', ''), compfull)
                     vis_c.append(vc); det_c.append(dc); match_c.append(vc is not None or dc is not None)
                     vis_v.append(vv); det_v.append(dv)
                 df['Visualización C'] = vis_c
@@ -654,8 +662,8 @@ with tab1:
                     lambda r: estado_visto(r.get('Visualización C'), r.get('Visualización V')), axis=1)
 
                 orden = ['Técnico', 'Motivo', 'Visto', 'Modalidad', 'Fecha', 'Hora', 'Jornada', 'Competicion', 'Provincia',
-                         'Nombre Club Casa', 'Equipo Casa', 'Visualización C', 'Detalles Equipo Casa',
-                         'Nombre Club Visitante', 'Equipo Visitante', 'Visualización V', 'Detalles Equipo Visitante',
+                         'Nombre Club Casa', 'Visualización C', 'Detalles Equipo Casa',
+                         'Nombre Club Visitante', 'Visualización V', 'Detalles Equipo Visitante',
                          'Campo', 'Dirección Campo']
                 orden = [c for c in orden if c in df.columns]
                 df_resultado = df[orden].copy()
